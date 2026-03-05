@@ -77,6 +77,13 @@ class ValidatorConfig:
     delta_threshold: float = 0.05
     ema_alpha: float = 0.3  # Per-scenario EMA smoothing factor
 
+    # Cost-based scoring config
+    cost_delta: float = 0.10  # Challenger must be 10% cheaper to dethrone
+    cost_ema_alpha: float = 0.3  # EMA smoothing for per-scenario cost
+    required_categories: List[str] = field(
+        default_factory=lambda: ["safety", "correctness"]
+    )
+
     # Consensus config (mitigates LLM non-determinism across validators)
     consensus_epsilon: float = 0.02
 

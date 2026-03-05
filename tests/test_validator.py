@@ -1617,6 +1617,9 @@ class TestPerScenarioEMA:
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.ema_alpha = 0.3
+            config.cost_ema_alpha = 0.3
+            config.cost_delta = 0.10
+            config.required_categories = ["safety", "correctness"]
             config.ema_state_path = Path("/tmp/test_ema_state.json")
             config.pack_cache_dir = Path("/tmp/test_packs")
             config.pack_cache_max_size = 100
@@ -1637,6 +1640,8 @@ class TestPerScenarioEMA:
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
             validator.ema_scores = {}
+            validator.ema_costs = {}
+            validator.scenario_qualified = {}
             validator._ema_pack_hash = {}
             validator.last_eval_block = {}
             validator.first_mover_data = {}
@@ -1753,13 +1758,15 @@ class TestPerScenarioEMA:
         assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
 
     def test_ema_persistence_roundtrip(self):
-        """EMA state can be saved and loaded."""
+        """EMA state v2 can be saved and loaded."""
         v = self._make_validator()
         v._scenario_config_hash = "test_hash"
         v.ema_scores = {"hk_0": {"client_escalation": 0.85}}
+        v.ema_costs = {"hk_0": {"client_escalation": 0.042}}
+        v.scenario_qualified = {"hk_0": {"client_escalation": True}}
         v._ema_pack_hash = {"hk_0": "hash_a"}
         v.last_eval_block = {"hk_0": 99000}
-        v.first_mover_data = {"hk_0": (0.85, 1000.0)}
+        v.first_mover_data = {"hk_0": (0.042, 1000.0)}
 
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
             v.config.ema_state_path = Path(f.name)
@@ -1774,11 +1781,139 @@ class TestPerScenarioEMA:
             v2._load_ema_state()
 
             assert v2.ema_scores == {"hk_0": {"client_escalation": 0.85}}
+            assert v2.ema_costs == {"hk_0": {"client_escalation": 0.042}}
+            assert v2.scenario_qualified == {"hk_0": {"client_escalation": True}}
             assert v2._ema_pack_hash == {"hk_0": "hash_a"}
             assert v2.last_eval_block == {"hk_0": 99000}
-            assert v2.first_mover_data == {"hk_0": (0.85, 1000.0)}
+            assert v2.first_mover_data == {"hk_0": (0.042, 1000.0)}
         finally:
             v.config.ema_state_path.unlink(missing_ok=True)
+
+    def test_ema_v1_to_v2_migration(self):
+        """Loading v1 state clears first_mover_data (semantics changed)."""
+        v = self._make_validator()
+        v._scenario_config_hash = "test_hash"
+
+        # Write v1 format (no "version" key)
+        v1_data = {
+            "scenario_config_hash": "test_hash",
+            "ema_scores": {"hk_0": {"client_escalation": 0.85}},
+            "ema_pack_hash": {"hk_0": "hash_a"},
+            "last_eval_block": {"hk_0": 99000},
+            "first_mover_data": {"hk_0": [0.85, 1000.0]},
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump(v1_data, f)
+            path = Path(f.name)
+
+        try:
+            v.config.ema_state_path = path
+            v._load_ema_state()
+
+            # Scores and pack_hash preserved
+            assert v.ema_scores == {"hk_0": {"client_escalation": 0.85}}
+            assert v._ema_pack_hash == {"hk_0": "hash_a"}
+            # first_mover_data cleared (score→cost semantics change)
+            assert v.first_mover_data == {}
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_ema_cost_tracking(self):
+        """Cost EMA tracks per-scenario costs."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+            scenario_qualified={"client_escalation": True},
+        )
+        assert v.ema_costs["hk_0"]["client_escalation"] == 0.050
+        assert v.scenario_qualified["hk_0"]["client_escalation"] is True
+
+    def test_ema_cost_smoothing(self):
+        """Cost EMA applies smoothing on second observation."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+        )
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.85},
+            scenario_costs={"client_escalation": 0.030},
+        )
+        # α=0.3: 0.3*0.030 + 0.7*0.050 = 0.009 + 0.035 = 0.044
+        assert abs(v.ema_costs["hk_0"]["client_escalation"] - 0.044) < 1e-6
+
+    def test_ema_cost_resets_on_pack_change(self):
+        """Cost EMA resets when pack changes."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+        )
+        v._update_ema("hk_0", "hash_b",
+            scenario_scores={"client_escalation": 0.85},
+            scenario_costs={"client_escalation": 0.030},
+        )
+        # Fresh start after pack change
+        assert v.ema_costs["hk_0"]["client_escalation"] == 0.030
+
+    def test_compute_total_cost_from_ema(self):
+        """Total cost from EMA is weighted average across scenarios."""
+        v = self._make_validator()
+        v.ema_costs["hk_0"] = {
+            "client_escalation": 0.050,  # weight 1.5
+            "morning_brief": 0.030,      # weight 1.0
+        }
+        # weighted_avg = (1.5*0.050 + 1.0*0.030) / 2.5 = (0.075 + 0.030) / 2.5 = 0.042
+        cost = v.compute_total_cost_from_ema("hk_0")
+        assert abs(cost - 0.042) < 1e-6
+
+    def test_compute_total_cost_no_data(self):
+        """No cost data returns None."""
+        v = self._make_validator()
+        assert v.compute_total_cost_from_ema("hk_unknown") is None
+
+    def test_is_fully_qualified(self):
+        """Fully qualified requires all scenarios to pass."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            "morning_brief": True,
+        }
+        assert v.is_fully_qualified("hk_0") is True
+
+    def test_is_not_fully_qualified(self):
+        """One failing scenario = not qualified."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            "morning_brief": False,
+        }
+        assert v.is_fully_qualified("hk_0") is False
+
+    def test_is_not_qualified_missing_scenario(self):
+        """Missing scenario data = not qualified."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            # morning_brief missing
+        }
+        assert v.is_fully_qualified("hk_0") is False
+
+    def test_first_mover_tracks_cost(self):
+        """First-mover data tracks best (lowest) cost."""
+        v = self._make_validator()
+        v._update_first_mover(0, "hk_0", cost=0.050, block_number=1000.0)
+        assert v.first_mover_data["hk_0"] == (0.050, 1000.0)
+
+        # Cost improves (lower)
+        v._update_first_mover(0, "hk_0", cost=0.030, block_number=2000.0)
+        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)  # block preserved
+
+        # Cost regresses (higher) — no update
+        v._update_first_mover(0, "hk_0", cost=0.040, block_number=3000.0)
+        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)
 
     def test_ema_invalidated_on_scenario_pool_change(self):
         """Loading EMA state with different scenario config invalidates all state."""
@@ -1840,6 +1975,9 @@ class TestInactivityBlocks:
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
             config.ema_alpha = 0.3
+            config.cost_ema_alpha = 0.3
+            config.cost_delta = 0.10
+            config.required_categories = ["safety", "correctness"]
             config.ema_state_path = Path("/tmp/test_ema_state.json")
 
             mock_subtensor = MagicMock()
@@ -1857,6 +1995,8 @@ class TestInactivityBlocks:
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
             validator.ema_scores = {}
+            validator.ema_costs = {}
+            validator.scenario_qualified = {}
             validator._ema_pack_hash = {}
             validator.last_eval_block = {}
             validator.first_mover_data = {}
@@ -1970,54 +2110,67 @@ class TestScoringIntegration:
     def test_json_output_to_evaluation_result(self, harness):
         """ClawBench --json output → _parse_episode_output → EvaluationResult."""
         json_output = json.dumps({
-            "score": 0.88,
             "success": True,
+            "checks_passed": 25,
+            "checks_total": 25,
             "tool_calls": 11,
             "response": "Summary of actions taken...",
             "rubric": {
-                "score": 0.88,
-                "points_earned": 35,
-                "points_possible": 40,
-                "by_category": {"safety": {"score": 1.0}},
+                "passed": 25,
+                "total": 25,
+                "checks": [],
+                "failed_ids": [],
+            },
+            "cost": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "total_usd": 0.042,
             },
         })
 
         parsed = harness._parse_episode_output(json_output)
+        checks_passed = parsed.get("checks_passed", 0)
+        checks_total = parsed.get("checks_total", 0)
+        score = checks_passed / checks_total if checks_total > 0 else 0.0
         result = EvaluationResult(
             scenario_name="client_escalation",
-            score=parsed["score"],
+            score=score,
             success=parsed["success"],
             tool_calls=parsed["tool_calls"],
             response=parsed["response"],
             rubric=parsed["rubric"],
+            cost_usd=parsed.get("cost", {}).get("total_usd"),
         )
 
-        assert result.score == 0.88
+        assert result.score == 1.0
         assert result.success is True
         assert result.tool_calls == 11
+        assert result.cost_usd == 0.042
 
     def test_full_pipeline_json_to_weights(self, harness, scorer):
         """Full: 4 scenario JSON outputs → aggregate → final score → winner."""
         scenario_outputs = [
-            ("client_escalation", 0.92),
-            ("morning_brief", 0.85),
-            ("inbox_to_action", 0.78),
-            ("team_standup", 0.88),
+            ("client_escalation", 23, 25),
+            ("morning_brief", 21, 25),
+            ("inbox_to_action", 20, 25),
+            ("team_standup", 22, 25),
         ]
 
         results = []
-        for scenario, score in scenario_outputs:
+        for scenario, passed, total in scenario_outputs:
+            score = passed / total
             json_output = json.dumps({
-                "score": score,
-                "success": score > 0.5,
+                "success": passed == total,
+                "checks_passed": passed,
+                "checks_total": total,
                 "tool_calls": 10,
                 "response": f"{scenario} done",
-                "rubric": {"score": score},
+                "rubric": {"passed": passed, "total": total, "checks": [], "failed_ids": []},
             })
             parsed = harness._parse_episode_output(json_output)
             results.append(EvaluationResult(
                 scenario_name=scenario,
-                score=parsed["score"],
+                score=score,
                 success=parsed["success"],
                 tool_calls=parsed["tool_calls"],
                 response=parsed["response"],
@@ -2037,6 +2190,69 @@ class TestScoringIntegration:
         assert weights[0] == 1.0  # Higher score wins
         assert weights[1] == 0.0
         assert 0.0 < final <= 1.0
+
+    def test_cost_based_winner_selection(self, scorer):
+        """Cost-based winner: cheapest qualified miner wins."""
+        costs = {0: 0.050, 1: 0.030, 2: 0.045}
+        qualified = {0: True, 1: True, 2: False}  # miner 2 disqualified
+        first_mover = {
+            "hk_0": (0.050, 100.0),
+            "hk_1": (0.030, 200.0),
+        }
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data=first_mover,
+            cost_delta=0.10,
+            num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # Miner 1 is cheapest qualified ($0.030 < $0.050 * 0.90 = $0.045)
+        assert weights[1] == 1.0
+        assert weights[0] == 0.0
+        assert weights[2] == 0.0  # disqualified
+
+    def test_cost_first_mover_protection(self, scorer):
+        """First-mover protection: challenger must be 10% cheaper."""
+        costs = {0: 0.050, 1: 0.048}  # 1 is cheaper but not by 10%
+        qualified = {0: True, 1: True}
+        first_mover = {
+            "hk_0": (0.050, 100.0),  # submitted first
+            "hk_1": (0.048, 200.0),
+        }
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data=first_mover,
+            cost_delta=0.10,
+            num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # Miner 0 wins: $0.048 is NOT < $0.050 * 0.90 = $0.045
+        assert weights[0] == 1.0
+        assert weights[1] == 0.0
+
+    def test_cost_all_disqualified(self, scorer):
+        """All miners disqualified → zero weights."""
+        costs = {0: 0.050, 1: 0.030}
+        qualified = {0: False, 1: False}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data={},
+            cost_delta=0.10,
+            num_active_miners=20,
+        )
+
+        assert weights[0] == 0.0
+        assert weights[1] == 0.0
 
     def test_clawbench_scoring_roundtrip(self):
         """Test that clawbench scoring.py output matches what harness expects."""
