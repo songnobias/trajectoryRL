@@ -158,12 +158,7 @@ class TrajectoryValidator:
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
     def _load_ema_state(self):
-        """Load persisted EMA state from disk.
-
-        Handles v1 → v2 migration: v1 used score-based first_mover_data,
-        v2 uses cost-based. On migration, first_mover_data is cleared since
-        the semantics changed (score = higher is better → cost = lower is better).
-        """
+        """Load persisted EMA state from disk."""
         path = self.config.ema_state_path
         if not path.exists():
             logger.info("No persisted EMA state found, starting fresh")
@@ -176,32 +171,20 @@ class TrajectoryValidator:
                 )
                 return
 
-            version = data.get("version", 1)
-
             self.ema_scores = data.get("ema_scores", {})
+            self.ema_costs = data.get("ema_costs", {})
+            self.scenario_qualified = data.get("scenario_qualified", {})
             self._ema_pack_hash = data.get("ema_pack_hash", {})
             self.last_eval_block = {
                 k: int(v) for k, v in data.get("last_eval_block", {}).items()
             }
-
-            if version >= 2:
-                # v2: cost-based first_mover_data
-                self.first_mover_data = {
-                    k: (v[0], v[1])
-                    for k, v in data.get("first_mover_data", {}).items()
-                }
-                self.ema_costs = data.get("ema_costs", {})
-                self.scenario_qualified = data.get("scenario_qualified", {})
-            else:
-                # v1 → v2 migration: clear first_mover_data (semantics changed)
-                logger.info(
-                    "EMA state v1 → v2 migration: clearing first_mover_data "
-                    "(score-based → cost-based)"
-                )
-                self.first_mover_data = {}
+            self.first_mover_data = {
+                k: (v[0], v[1])
+                for k, v in data.get("first_mover_data", {}).items()
+            }
 
             logger.info(
-                f"Loaded EMA state v{version}: {len(self.ema_scores)} hotkeys, "
+                f"Loaded EMA state: {len(self.ema_scores)} hotkeys, "
                 f"{len(self.first_mover_data)} first-mover entries"
             )
         except Exception as e:
@@ -210,7 +193,6 @@ class TrajectoryValidator:
     def _save_ema_state(self):
         """Persist EMA state to disk for restart recovery."""
         data = {
-            "version": 2,
             "scenario_config_hash": self._scenario_config_hash,
             "ema_scores": self.ema_scores,
             "ema_costs": self.ema_costs,

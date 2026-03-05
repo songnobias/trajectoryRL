@@ -1789,36 +1789,6 @@ class TestPerScenarioEMA:
         finally:
             v.config.ema_state_path.unlink(missing_ok=True)
 
-    def test_ema_v1_to_v2_migration(self):
-        """Loading v1 state clears first_mover_data (semantics changed)."""
-        v = self._make_validator()
-        v._scenario_config_hash = "test_hash"
-
-        # Write v1 format (no "version" key)
-        v1_data = {
-            "scenario_config_hash": "test_hash",
-            "ema_scores": {"hk_0": {"client_escalation": 0.85}},
-            "ema_pack_hash": {"hk_0": "hash_a"},
-            "last_eval_block": {"hk_0": 99000},
-            "first_mover_data": {"hk_0": [0.85, 1000.0]},
-        }
-
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
-            json.dump(v1_data, f)
-            path = Path(f.name)
-
-        try:
-            v.config.ema_state_path = path
-            v._load_ema_state()
-
-            # Scores and pack_hash preserved
-            assert v.ema_scores == {"hk_0": {"client_escalation": 0.85}}
-            assert v._ema_pack_hash == {"hk_0": "hash_a"}
-            # first_mover_data cleared (score→cost semantics change)
-            assert v.first_mover_data == {}
-        finally:
-            path.unlink(missing_ok=True)
-
     def test_ema_cost_tracking(self):
         """Cost EMA tracks per-scenario costs."""
         v = self._make_validator()
