@@ -841,6 +841,49 @@ class TrajectoryValidator:
         }
 
     # ------------------------------------------------------------------
+    # Report metadata
+    # ------------------------------------------------------------------
+
+    def _build_report_metadata(
+        self,
+        active: Dict[int, "MinerCommitment"],
+        scores: Dict[int, float],
+        costs: Dict[int, float],
+        qualified: Dict[int, bool],
+        weights_dict: Optional[Dict[int, float]] = None,
+    ) -> None:
+        """Build report metadata from ALL active miners.
+
+        Uses commitments for pack_url and EMA state for score/cost so
+        that the metadata always contains the full picture regardless of
+        which weight-setting path was taken.
+        """
+        if weights_dict is None:
+            weights_dict = {}
+
+        miner_scores: Dict[str, Dict[str, Any]] = {}
+        for uid, commitment in active.items():
+            hk = commitment.hotkey
+            entry: Dict[str, Any] = {
+                "uid": uid,
+                "pack_url": commitment.pack_url,
+                "score": round(scores.get(uid, 0), 4),
+                "weight": round(weights_dict.get(uid, 0), 4),
+                "qualified": qualified.get(uid, False),
+            }
+            cost = costs.get(uid)
+            if cost is None:
+                cost_from_ema = self.compute_total_cost_from_ema(hk)
+                if cost_from_ema is not None:
+                    cost = cost_from_ema
+            if cost is not None:
+                entry["cost"] = round(cost, 4)
+            miner_scores[hk] = entry
+
+        self._report_metadata["miner_scores"] = miner_scores
+        self._report_metadata["miners_evaluated"] = len(miner_scores)
+
+    # ------------------------------------------------------------------
     # Weight setting
     # ------------------------------------------------------------------
 
@@ -888,6 +931,7 @@ class TrajectoryValidator:
 
         if not scores:
             logger.warning("All miners have zero EMA score")
+            self._build_report_metadata(active, scores, costs, qualified)
             await self._set_fallback_weights()
             return
 
@@ -950,26 +994,8 @@ class TrajectoryValidator:
                 f"score={scores.get(uid, 0):.3f}{marker}"
             )
 
-        # Update report metadata with miner scores
-        miner_scores = {}
-        for uid, weight in weights_dict.items():
-            hk = uid_to_hotkey.get(uid, "")
-            if not hk:
-                continue
-            entry: Dict[str, Any] = {
-                "uid": uid,
-                "score": round(scores.get(uid, 0), 4),
-                "weight": round(weight, 4),
-                "qualified": qualified.get(uid, False),
-            }
-            if uid in costs:
-                entry["cost"] = round(costs[uid], 4)
-            commitment = active.get(uid)
-            if commitment:
-                entry["pack_url"] = commitment.pack_url
-            miner_scores[hk] = entry
-        self._report_metadata["miner_scores"] = miner_scores
-        self._report_metadata["miners_evaluated"] = len(miner_scores)
+        # Update report metadata with ALL active miners (not just winners)
+        self._build_report_metadata(active, scores, costs, qualified, weights_dict)
 
         # Set weights on chain
         if SHADOW_MODE:
