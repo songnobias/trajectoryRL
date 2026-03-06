@@ -39,7 +39,11 @@ async def report_status(
     Returns:
         True on successful report (HTTP 200), False otherwise.
     """
-    hotkey_kp = wallet.hotkey
+    try:
+        hotkey_kp = wallet.hotkey
+    except Exception:
+        logger.debug("Skipping status report: wallet hotkey not available")
+        return False
     hotkey_addr = hotkey_kp.ss58_address
     timestamp = int(time.time())
 
