@@ -2,7 +2,7 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v3.1
+**Version**: v3.2
 
 **Date**: 2026-03-07
 
@@ -938,6 +938,6 @@ Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v3.1
+**Version**: v3.2
 
 **Date**: 2026-03-07
