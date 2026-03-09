@@ -6,7 +6,7 @@ types, producing a generic policy that scores well across all five scenarios.
 
 Uses an OpenAI-compatible endpoint configured via ``CLAWBENCH_LLM_API_KEY``,
 ``CLAWBENCH_LLM_BASE_URL``, and ``CLAWBENCH_DEFAULT_MODEL`` environment variables.
-Default provider is Chutes (https://llm.chutes.ai/v1) with GLM-5.
+Default provider is Zhipu (https://open.bigmodel.cn/api/paas/v4) with GLM-5.
 """
 
 import logging
