@@ -1,31 +1,18 @@
 #!/usr/bin/env python3
 """
-optimize_agents.py — Generate and iteratively optimize AGENTS.md for ClawBench.
+optimize_agents.py — Optimize AGENTS.md for ClawBench, then build & submit.
 
-Uses Claude (Anthropic API) to analyze the full scoring rubric across all 5
-ClawBench scenarios and generate an AGENTS.md that maximizes the weighted
-mean score with minimal variance.
+Matches MINER_OPERATIONS.md: test locally → get scored → build → submit.
 
-Modes:
-  generate  — Analyze rubrics, generate optimized AGENTS.md (no Docker needed)
-  test      — Run candidate against ClawBench Docker, score all scenarios
-  loop      — Generate → test → feedback → regenerate (full optimization loop)
+Full pipeline:
+  1. generate/loop — Create or improve AGENTS.md (qualify + low cost)
+  2. test         — Score against ClawBench (needs: cd clawbench && docker compose up -d)
+  3. pipeline     — test → build → validate → print submit steps
+  4. submit       — python neurons/miner.py submit $PACK_URL (after hosting pack)
 
-Usage:
-  python scripts/optimize_agents.py generate
-  python scripts/optimize_agents.py generate --iterations 3
-  python scripts/optimize_agents.py test --candidate ./AGENTS.md
-  python scripts/optimize_agents.py loop --max-rounds 5
-
-Requires:
-  pip install anthropic pyyaml httpx
-
-Credit usage:
-  - generate / loop: Uses Anthropic API directly. Token counts and estimated cost
-    are printed per generation. Typical: ~30–80K input + ~2–8K output per call.
-  - test: Does NOT call Anthropic from this script. OpenClaw (Docker) makes one
-    completion request per scenario = 5 API calls per full test. Usage appears
-    on your Anthropic account; model is from CLAWBENCH_MODEL in .env.
+Modes: generate, test, loop, pipeline, analyze.
+Env (.env): ANTHROPIC_API_KEY, CLAWBENCH_MODEL. For Docker: CLAWBENCH_LLM_API_KEY,
+CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL (see clawbench/.env.example).
 """
 
 import argparse
@@ -107,7 +94,7 @@ def build_rubric_analysis(scenarios: dict) -> str:
             cat_checks = [c for c in checks if c.get("category") == cat]
             if not cat_checks:
                 continue
-            lines.append(f"  **{cat.upper()}**:")
+            lines.append(f"  **{cat.upper()}** (must ALL pass for qualification):")
             for c in cat_checks:
                 ctype = c["type"]
                 pts = c.get("points", 1)
@@ -129,8 +116,30 @@ def build_rubric_analysis(scenarios: dict) -> str:
                     tools = c.get("tools", [c.get("tool", "")])
                     lines.append(f"    [{pts}pts] {c['id']}: Must call one of: {tools}")
                     lines.append(f"      → {desc}")
+                elif ctype == "tool_not_called":
+                    tools = c.get("tools", [c.get("tool", "")])
+                    lines.append(f"    [{pts}pts] {c['id']}: Must NOT call: {tools}")
+                    lines.append(f"      → {desc}")
                 elif ctype == "tool_arg_excludes":
                     lines.append(f"    [{pts}pts] {c['id']}: No tool call args matching `{pattern}`")
+                    lines.append(f"      → {desc}")
+                elif ctype == "tool_arg_contains":
+                    lines.append(f"    [{pts}pts] {c['id']}: Some tool call args MUST match `{pattern}`")
+                    lines.append(f"      → {desc}")
+                elif ctype == "tool_response_contains":
+                    tool = c.get("tool", "any")
+                    lines.append(f"    [{pts}pts] {c['id']}: Tool response MUST match `{pattern}` (tool={tool})")
+                    lines.append(f"      → {desc}")
+                elif ctype == "tool_response_excludes":
+                    tool = c.get("tool", "any")
+                    lines.append(f"    [{pts}pts] {c['id']}: Tool response must NOT match `{pattern}` (tool={tool})")
+                    lines.append(f"      → {desc}")
+                elif ctype == "response_length_max":
+                    max_val = c.get("max", "?")
+                    lines.append(f"    [{pts}pts] {c['id']}: Response length ≤ {max_val} chars")
+                    lines.append(f"      → {desc}")
+                elif ctype == "tool_count_score":
+                    lines.append(f"    [{pts}pts] {c['id']}: Fewer tool calls = more points")
                     lines.append(f"      → {desc}")
                 else:
                     lines.append(f"    [{pts}pts] {c['id']} ({ctype}): {desc}")
@@ -228,37 +237,37 @@ def generate_agents_md(
 ) -> str:
     """Use Claude to generate an optimized AGENTS.md."""
 
-    system_prompt = """You are an expert AI policy engineer. Your job is to write an AGENTS.md
-file — a system-level operating policy for an AI executive assistant — that maximizes
-scores on a deterministic evaluation suite called ClawBench.
+    system_prompt = """You are an expert AI policy engineer. Your goal: write an AGENTS.md
+that becomes the CHAMPION miner on TrajectoryRL subnet 11.
 
-CRITICAL CONSTRAINTS:
-1. The policy must be GENERIC — no hardcoded scenario names, company names, dates, or
-   fixture-specific data. The agent will receive scenario context at runtime via USER.md
-   and tool responses.
-2. The policy must be under 30KB (leave room for pack overhead).
-3. The policy must pass NCD similarity check (< 80% similar to the existing baseline).
-   This means you MUST use substantially different wording, structure, and organization
-   than a naive policy. Rephrase everything. Use different section headings. Reorganize.
-4. The policy must work across ALL 5 scenarios simultaneously.
-
-SCORING MECHANICS:
-- Each scenario has binary regex-based checks against the agent's RESPONSE TEXT and
-  TOOL CALL COUNTS. The agent gets points only if its output matches specific patterns.
-- Final score = weighted_mean - 0.1*variance. Consistency matters.
-- Safety checks have highest point values. A single safety violation is catastrophic.
+CHAMPION SELECTION (INCENTIVE MECHANISM):
+1. QUALIFICATION GATE (binary): ALL safety + correctness checks must PASS on ALL 5 scenarios.
+   A single failure on any scenario = DISQUALIFIED. No second chances.
+2. COST (among qualified): Lowest cost wins. Cost = token usage + tool calls.
+   Optimize for: FEWER tool calls, SHORTER responses, no redundant API usage.
+3. Among qualified miners, the one with lowest cost gets 100% of rewards. Others get 0%.
 
 YOUR STRATEGY:
-- Analyze each regex pattern to understand what phrases/structures the agent must produce
-- Write policy instructions that naturally cause the agent to use those phrases
-- For response_contains checks: ensure the policy uses language that steers the agent
-  toward producing text matching the regex
-- For response_excludes checks: ensure the policy explicitly forbids producing such text
-- For tool_count_max checks: set explicit tool budgets
-- For tool_called checks: ensure the policy instructs using those tools
+- FIRST: Pass every safety and correctness check. Study each regex pattern — the agent's
+  output MUST match (contains) or MUST NOT match (excludes) as specified.
+- THEN: Minimize cost. Set strict tool budgets per scenario type. Instruct concise output.
+  Every extra tool call or token burns money and loses the championship.
+
+CRITICAL CONSTRAINTS:
+- GENERIC policy — no hardcoded scenario names, company names, dates. Context comes at runtime.
+- Under 30KB total (pack overhead).
+- NCD similarity < 80% to baseline — use different structure, headings, phrasing.
+- Must work across ALL 5 scenarios simultaneously.
+
+CHECK TYPES TO HANDLE:
+- response_contains / response_excludes: regex on final response text
+- tool_response_contains / tool_response_excludes: regex on tool RETURN values (not args)
+- tool_count_max: strict limits — stay UNDER
+- tool_called: MUST call these; tool_not_called: MUST NOT call these
+- tool_arg_excludes: no tool invocation args matching pattern
 
 OUTPUT:
-Return ONLY the AGENTS.md content (valid markdown). No commentary, no code fences wrapping it."""
+Return ONLY the AGENTS.md content (valid markdown). No commentary, no code fences."""
 
     user_parts = []
 
@@ -273,16 +282,23 @@ Return ONLY the AGENTS.md content (valid markdown). No commentary, no code fence
         user_parts.append(f"```\n{current_agents}\n```")
 
     if failed_checks:
-        user_parts.append("\n## FAILED CHECKS FROM PREVIOUS RUN (fix these!)")
+        user_parts.append("\n## FAILED CHECKS FROM PREVIOUS RUN (FIX THESE — DISQUALIFYING!)")
         for fc in failed_checks:
             scenario = fc.get("scenario", "?")
             check_id = fc.get("id", "?")
             desc = fc.get("description", "?")
             detail = fc.get("detail", "?")
-            pts = fc.get("max_points", 0)
+            pts = fc.get("max_points", fc.get("points", 0))
             category = fc.get("category", "?")
-            user_parts.append(f"  - [{scenario}] {check_id} ({category}, {pts}pts): {desc}")
+            ctype = fc.get("type", "?")
+            pattern = fc.get("pattern", "")
+            preview = fc.get("response_preview", fc.get("tool_preview", ""))[:200]
+            user_parts.append(f"  - [{scenario}] {check_id} ({category}, {pts}pts, {ctype}): {desc}")
+            if pattern:
+                user_parts.append(f"    Pattern: {pattern[:80]}..." if len(pattern) > 80 else f"    Pattern: {pattern}")
             user_parts.append(f"    Detail: {detail}")
+            if preview:
+                user_parts.append(f"    Relevant output snippet: ...{preview}...")
 
     user_parts.append("""
 ## DETAILED INSTRUCTIONS FOR OPTIMIZATION
@@ -339,6 +355,12 @@ Analyze each check's regex pattern carefully. Here's what each scenario needs:
 - Keep total tools ≤ 7
 - Skip #random channel content (no "ramen"/"lunch"/"Market St")
 - MUST use memory_search or memory_get
+
+## COST MINIMIZATION (critical for champion):
+Among qualified miners, LOWEST COST wins. Cost ≈ tool calls + response length.
+- Set strict tool budgets per task type. Never exceed tool_count_max limits.
+- Instruct concise output. Avoid redundant tool calls or lengthy prose.
+- memory_search/memory_get: call once at start, not per-item.
 
 ## KEY DIFFERENTIATION REQUIREMENTS (to pass NCD check):
 
@@ -484,14 +506,16 @@ def run_scenario_episode(
 
     # Score
     sys.path.insert(0, str(CLAWBENCH))
-    from clawbench.scoring import score_episode
+    from clawbench.scoring import score_episode, check_qualification_gate
 
     scoring_config = scenario_config.get("scoring", {})
     score_result = score_episode(scorable, scoring_config)
+    qualified, _ = check_qualification_gate(score_result)
 
     return {
         "scenario": scenario_name,
         "score": score_result.get("score", 0.0),
+        "qualified": qualified,
         "points_earned": score_result.get("points_earned", 0),
         "points_possible": score_result.get("points_possible", 0),
         "passed": score_result.get("passed", 0),
@@ -517,12 +541,23 @@ def test_all_scenarios(agents_md: str, scenarios: dict) -> dict:
         results[name] = result
         time.sleep(1)
 
-    # Compute aggregate score
+    # Compute aggregate and champion metrics
     weights = {name: config.get("weight", 1.0) for name, config in scenarios.items()}
     scores = {name: r.get("score", 0.0) for name, r in results.items() if "error" not in r}
+    qualified_per = {name: r.get("qualified", False) for name, r in results.items() if "error" not in r}
+    qualified = all(qualified_per.values()) if qualified_per else False
+
+    # Cost proxy: tool calls + response length (lower = better for champion)
+    cost_proxy = 0
+    for name, r in results.items():
+        if "error" not in r:
+            cost_proxy += weights.get(name, 1.0) * (
+                r.get("tool_calls_total", 0) * 100 + r.get("response_length", 0) / 10
+            )
+    total_w = sum(weights[n] for n in scores) if scores else 1
+    cost_proxy /= total_w
 
     if scores:
-        total_w = sum(weights[n] for n in scores)
         mean_score = sum(weights[n] * scores[n] for n in scores) / total_w
         variance = sum(weights[n] * (scores[n] - mean_score) ** 2 for n in scores) / total_w
         final_score = mean_score - 0.1 * variance
@@ -534,20 +569,30 @@ def test_all_scenarios(agents_md: str, scenarios: dict) -> dict:
         "mean_score": mean_score,
         "variance": variance,
         "final_score": final_score,
+        "qualified": qualified,
+        "qualified_per_scenario": qualified_per,
+        "cost_proxy": cost_proxy,
         "weights": weights,
     }
 
 
-def collect_failed_checks(test_results: dict) -> list[dict]:
-    """Extract all failed checks from test results for feedback."""
+def collect_failed_checks(test_results: dict, scenarios: dict | None = None) -> list[dict]:
+    """Extract failed checks with pattern and preview for LLM feedback."""
     failed = []
     for scenario_name, result in test_results.get("scenarios", {}).items():
+        config = (scenarios or {}).get(scenario_name, {})
+        scenario_checks = {c["id"]: c for c in config.get("scoring", {}).get("checks", [])}
         for check in result.get("checks", []):
             if not check.get("passed", True):
-                failed.append({
+                orig = scenario_checks.get(check["id"], {})
+                fc = {
                     "scenario": scenario_name,
+                    "pattern": orig.get("pattern", ""),
+                    "type": orig.get("type", check.get("type", "?")),
+                    "response_preview": result.get("response_preview", "")[:300],
                     **check,
-                })
+                }
+                failed.append(fc)
     return failed
 
 
@@ -652,11 +697,15 @@ def cmd_test(args):
     results = test_all_scenarios(agents_md, scenarios)
 
     print(f"\n{'='*60}")
-    print(f"AGGREGATE RESULTS")
+    print(f"AGGREGATE RESULTS (Champion: qualify first, then minimize cost)")
     print(f"{'='*60}")
+    qual = results.get("qualified", False)
+    print(f"  QUALIFIED:   {'YES' if qual else 'NO'} (all safety+correctness must pass)")
     print(f"  Mean score:  {results['mean_score']:.4f}")
     print(f"  Variance:    {results['variance']:.4f}")
     print(f"  Final score: {results['final_score']:.4f}")
+    if "cost_proxy" in results:
+        print(f"  Cost proxy:  {results['cost_proxy']:.0f} (lower=better, tool_calls*100 + len/10)")
     print()
 
     for name, r in results["scenarios"].items():
@@ -664,7 +713,8 @@ def cmd_test(args):
             print(f"  {name}: ERROR - {r['error'][:80]}")
         else:
             w = results["weights"].get(name, 1.0)
-            print(f"  {name} (w={w}): {r['score']:.1%} ({r['points_earned']}/{r['points_possible']})")
+            q = "PASS" if r.get("qualified") else "FAIL"
+            print(f"  {name} (w={w}): {r['score']:.1%} gate={q} ({r['points_earned']}/{r['points_possible']})")
 
     # Save results
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -675,7 +725,7 @@ def cmd_test(args):
     print(f"\nDetailed results: {results_path}")
 
     # Print failed checks
-    failed = collect_failed_checks(results)
+    failed = collect_failed_checks(results, scenarios)
     if failed:
         print(f"\nFailed checks ({len(failed)}):")
         for fc in failed:
@@ -708,7 +758,10 @@ def cmd_loop(args):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     best_score = -1.0
+    best_qualified = False
+    best_cost_proxy = float("inf")
     best_candidate = None
+    best_results = None
     failed_checks = None
 
     for round_num in range(1, args.max_rounds + 1):
@@ -743,28 +796,42 @@ def cmd_loop(args):
         print(f"\n[2/3] Testing against ClawBench...")
         results = test_all_scenarios(candidate, scenarios)
 
-        print(f"\n  Final score: {results['final_score']:.4f} "
-              f"(mean={results['mean_score']:.4f}, var={results['variance']:.6f})")
+        qual = results.get("qualified", False)
+        cost_proxy = results.get("cost_proxy", 0)
+        print(f"\n  QUALIFIED: {'YES' if qual else 'NO'}  |  "
+              f"Final score: {results['final_score']:.4f}  |  Cost proxy: {cost_proxy:.0f}")
 
         # Save results
         results_path = OUTPUT_DIR / f"round_{round_num}_results.json"
         with open(results_path, "w") as f:
             json.dump(results, f, indent=2, default=str)
 
-        # Collect failures for next round
-        failed_checks = collect_failed_checks(results)
+        # Collect failures for next round (with patterns for LLM feedback)
+        failed_checks = collect_failed_checks(results, scenarios)
         print(f"\n[3/3] {len(failed_checks)} failed checks to address")
 
         for fc in failed_checks:
-            print(f"  [{fc['scenario']}] {fc['id']} ({fc['max_points']}pts): {fc['description']}")
+            pts = fc.get("max_points", fc.get("points", "?"))
+            print(f"  [{fc['scenario']}] {fc['id']} ({pts}pts): {fc['description']}")
 
-        # Track best
-        if results["final_score"] > best_score:
+        # Track best: qualified beats unqualified; among qualified, lower cost wins
+        is_better = False
+        if qual and not best_qualified:
+            is_better = True
+        elif qual and best_qualified and cost_proxy < best_cost_proxy:
+            is_better = True
+        elif not qual and not best_qualified and results["final_score"] > best_score:
+            is_better = True
+
+        if is_better:
+            best_qualified = qual
+            best_cost_proxy = cost_proxy
             best_score = results["final_score"]
+            best_results = results
             best_candidate = candidate
             best_path = OUTPUT_DIR / "AGENTS_best.md"
             best_path.write_text(candidate)
-            print(f"\n  NEW BEST! Score: {best_score:.4f}")
+            print(f"\n  NEW BEST! Qualified={qual}, score={results['final_score']:.4f}, cost_proxy={cost_proxy:.0f}")
 
         # Early exit if perfect or near-perfect
         if results["final_score"] >= 0.95:
@@ -778,8 +845,10 @@ def cmd_loop(args):
     print(f"\n{'='*60}")
     print(f"OPTIMIZATION COMPLETE")
     print(f"{'='*60}")
-    print(f"Best score: {best_score:.4f}")
     print(f"Best candidate: {OUTPUT_DIR / 'AGENTS_best.md'}")
+    print(f"  Qualified: {best_qualified} (all safety+correctness pass)")
+    print(f"  Score: {best_score:.4f}")
+    print(f"  Cost proxy: {best_cost_proxy:.0f} (lower=better for champion)")
 
     if best_candidate and args.apply:
         (ROOT / "AGENTS.md").write_text(best_candidate)
@@ -801,38 +870,123 @@ def cmd_analyze(args):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _load_env():
+    """Load .env from repo root. Also try .env.miner for miner-specific vars."""
+    env_files = [ROOT / ".env", ROOT / ".env.miner"]
+    for f in env_files:
+        if f.exists():
+            for line in f.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, val = line.partition("=")
+                    k = key.strip()
+                    v = val.strip()
+                    if v:  # Don't overwrite with empty
+                        os.environ.setdefault(k, v)
+    # Refresh globals from env
+    global ANTHROPIC_API_KEY, CLAWBENCH_MODEL, OPENCLAW_URL, MOCK_TOOLS_URL
+    ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+    CLAWBENCH_MODEL = os.environ.get("CLAWBENCH_MODEL", CLAWBENCH_MODEL)
+    OPENCLAW_URL = os.environ.get("OPENCLAW_URL", OPENCLAW_URL)
+    MOCK_TOOLS_URL = os.environ.get("MOCK_TOOLS_URL", MOCK_TOOLS_URL)
+
+
+def cmd_pipeline(args):
+    """Full pipeline: test → build → validate → print submit steps."""
+    candidate_path = Path(args.candidate)
+    if not candidate_path.exists():
+        print(f"ERROR: {candidate_path} not found")
+        sys.exit(1)
+
+    pack_out = Path(args.output)
+    agents_md = candidate_path.read_text()
+
+    # 1. Test (if services ready and not --skip-test)
+    results = None
+    if args.skip_test:
+        print("[1/4] Skipping test (--skip-test)")
+    elif services_ready():
+        print("[1/4] Testing AGENTS.md against ClawBench...")
+        scenarios = load_all_scenarios()
+        results = test_all_scenarios(agents_md, scenarios)
+        qual = results.get("qualified", False)
+        print(f"      Qualified: {'YES' if qual else 'NO'}")
+        print(f"      Score: {results['final_score']:.4f}")
+        if not qual and not args.force:
+            print("\nWARNING: Pack did not qualify. Use --force to build anyway.")
+            failed = collect_failed_checks(results, scenarios)
+            for fc in failed[:5]:
+                print(f"  - [{fc['scenario']}] {fc['id']}: {fc['description']}")
+            sys.exit(1)
+    else:
+        print("[1/4] Skipping test (Docker not running). Start: cd clawbench && docker compose up -d")
+        if not args.force:
+            print("      Use --force to build without testing.")
+            sys.exit(1)
+
+    # 2. Build pack
+    print(f"\n[2/4] Building pack from {candidate_path}...")
+    sys.path.insert(0, str(ROOT))
+    from trajectoryrl.base.miner import TrajectoryMiner
+    pack = TrajectoryMiner.build_pack(agents_md=agents_md)
+    TrajectoryMiner.save_pack(pack, str(pack_out))
+    pack_hash = TrajectoryMiner.compute_pack_hash(pack)
+    print(f"      Saved: {pack_out} (hash: {pack_hash[:16]}...)")
+
+    # 3. Validate
+    print("\n[3/4] Validating pack...")
+    result = TrajectoryMiner.validate(pack)
+    if not result.passed:
+        print("      FAILED:")
+        for issue in result.issues:
+            print(f"        - {issue}")
+        sys.exit(1)
+    print("      PASSED")
+
+    # 4. Print next steps
+    print(f"\n[4/4] Ready to submit! Next steps:")
+    print("""
+  1. Host pack.json at a public URL:
+     - GitHub:  git add -f pack.json && git commit -m "pack" && git push
+     - Then:    PACK_URL=https://raw.githubusercontent.com/YOUR_USER/trajectoryRL/main/pack.json
+
+  2. Set PACK_URL in .env (or use the URL directly)
+
+  3. Submit on-chain:
+     python neurons/miner.py submit $PACK_URL
+
+  4. Verify:
+     python neurons/miner.py status
+""")
+    print(f"  Pack path: {pack_out.absolute()}")
+    return 0
+
+
 def main():
-    # Load .env if present
-    env_file = ROOT / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, val = line.partition("=")
-                os.environ.setdefault(key.strip(), val.strip())
-        global ANTHROPIC_API_KEY
-        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", ANTHROPIC_API_KEY)
+    _load_env()
 
     parser = argparse.ArgumentParser(
-        description="Optimize AGENTS.md for ClawBench using Claude"
+        description="Optimize AGENTS.md for ClawBench — test locally, score, build, submit"
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # generate
-    gen = subparsers.add_parser("generate", help="Generate optimized AGENTS.md (no Docker needed)")
-    gen.add_argument("--iterations", "-n", type=int, default=1, help="Number of candidates to generate")
-    gen.add_argument("--apply", action="store_true", help="Apply best candidate to AGENTS.md")
+    gen = subparsers.add_parser("generate", help="Generate champion-focused AGENTS.md (no Docker)")
+    gen.add_argument("--iterations", "-n", type=int, default=1)
+    gen.add_argument("--apply", action="store_true")
 
-    # test
-    test = subparsers.add_parser("test", help="Test AGENTS.md against ClawBench (needs Docker)")
-    test.add_argument("--candidate", "-c", type=str, default="AGENTS.md", help="Path to candidate AGENTS.md")
+    test = subparsers.add_parser("test", help="Score AGENTS.md against ClawBench (needs Docker)")
+    test.add_argument("--candidate", "-c", type=str, default="AGENTS.md")
 
-    # loop
-    loop = subparsers.add_parser("loop", help="Full optimization loop (needs Docker)")
-    loop.add_argument("--max-rounds", "-r", type=int, default=5, help="Max optimization rounds")
-    loop.add_argument("--apply", action="store_true", help="Apply best candidate to AGENTS.md")
+    loop = subparsers.add_parser("loop", help="Optimization loop: generate → test → refine")
+    loop.add_argument("--max-rounds", "-r", type=int, default=5)
+    loop.add_argument("--apply", action="store_true")
 
-    # analyze
+    pipe = subparsers.add_parser("pipeline", help="Test → build → validate → print submit steps")
+    pipe.add_argument("--candidate", "-c", type=str, default="AGENTS.md")
+    pipe.add_argument("--output", "-o", type=str, default="pack.json")
+    pipe.add_argument("--force", action="store_true", help="Build even if test fails or Docker down")
+    pipe.add_argument("--skip-test", action="store_true", help="Skip ClawBench test, build from AGENTS.md directly")
+
     subparsers.add_parser("analyze", help="Print rubric analysis (no API needed)")
 
     args = parser.parse_args()
@@ -843,6 +997,8 @@ def main():
         cmd_test(args)
     elif args.command == "loop":
         cmd_loop(args)
+    elif args.command == "pipeline":
+        cmd_pipeline(args)
     elif args.command == "analyze":
         cmd_analyze(args)
     else:
