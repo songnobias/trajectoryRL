@@ -82,6 +82,23 @@ python neurons/miner.py run --mode default
 
 ---
 
+## Local test then submit (manual pack)
+
+Use this when you already have an `AGENTS.md` (e.g. from `scripts/optimize_agents.py`) and want to validate locally, optionally score it with ClawBench, then submit on-chain.
+
+| Step | Command | Notes |
+|------|---------|--------|
+| 1. Build | `python neurons/miner.py build --agents-md AGENTS.md -o pack.json` | Builds OPP v1 pack from your policy |
+| 2. Validate | `python neurons/miner.py validate pack.json` | Schema + size check |
+| 3. Test (optional) | `python scripts/optimize_agents.py test --candidate AGENTS.md` | Runs all 5 ClawBench scenarios; needs Docker (clawbench + openclaw) |
+| 4. Host pack | Push `pack.json` to a public URL | e.g. `git add -f pack.json && git commit -m "pack" && git push` then use GitHub raw URL |
+| 5. Set PACK_URL | In `.env`: `PACK_URL=https://raw.githubusercontent.com/YOUR_USER/trajectoryRL/main/pack.json` | Or your S3/server URL |
+| 6. Submit | `python neurons/miner.py submit $PACK_URL` | Or `python neurons/miner.py submit https://...` |
+
+`pack.json` is in `.gitignore`; use `git add -f pack.json` to commit it for a GitHub raw URL. Ensure your wallet is registered on subnet 11 before submitting.
+
+---
+
 ## Run Modes
 
 ### Default Mode (Recommended)

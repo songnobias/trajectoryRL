@@ -250,8 +250,13 @@ class MinerConfig:
         from dotenv import load_dotenv
 
         if dotenv_path is None:
-            dotenv_path = Path(__file__).parent.parent.parent / ".env.miner"
-        if dotenv_path.exists():
+            root = Path(__file__).parent.parent.parent
+            # Prefer .env.miner, fall back to .env so one file works for both
+            for candidate in (root / ".env.miner", root / ".env"):
+                if candidate.exists():
+                    load_dotenv(candidate)
+                    break
+        elif dotenv_path.exists():
             load_dotenv(dotenv_path)
 
         return cls(
