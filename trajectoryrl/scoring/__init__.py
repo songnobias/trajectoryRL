@@ -1,7 +1,6 @@
 """Scoring functions for policy pack evaluation."""
 
 import logging
-import math
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -219,76 +218,48 @@ class TrajectoryScorer:
 
         # --- Steady-state: winner-take-all ---
 
-        # Find current best score
-        best_uid = max(scores.keys(), key=lambda uid: scores[uid])
-        best_score = scores[best_uid]
-
-        # Consensus epsilon: if multiple miners are within ε of the best,
-        # treat them as tied and pick the earliest submitter.
         eps = self.consensus_epsilon
-        tied_uids = [
-            uid for uid, s in scores.items()
-            if abs(s - best_score) <= eps
-        ]
 
-        resolved_by_epsilon = False
-        if len(tied_uids) > 1 and first_mover_data:
-            # Break tie by earliest block number (look up by hotkey)
-            tied_with_ts = []
-            for uid in tied_uids:
-                hk = _uid_to_hotkey.get(uid)
-                if hk and hk in first_mover_data:
-                    tied_with_ts.append((uid, first_mover_data[hk][1]))
-            if tied_with_ts:
-                tied_with_ts.sort(key=lambda x: x[1])  # lowest block first
-                best_uid = tied_with_ts[0][0]
-                best_score = scores[best_uid]
-                resolved_by_epsilon = True
-                logger.info(
-                    f"Consensus tie-break: {len(tied_uids)} miners within "
-                    f"ε={eps} of {best_score:.3f} → earliest is Miner {best_uid}"
-                )
+        # First-mover iterative selection: start with the earliest miner
+        # as champion, then iterate through subsequent miners in block
+        # order.  A later miner must beat the current champion's score
+        # by more than δ to take the crown.  This naturally handles
+        # transitive protection (A protects against B which protects
+        # against C) without needing recursive checks.
+        #
+        # Miners without first_mover_data are appended at the end with
+        # infinite block number so they can still participate but never
+        # receive first-mover protection.
 
-        # Apply first-mover protection (constant δ threshold).
-        # Only an EARLIER submitter can block a later challenger.
-        # Skip if winner was already resolved by epsilon tie-break (which
-        # already used block numbers, so re-applying delta would undo it).
-        if first_mover_data and not resolved_by_epsilon:
-            # Look up the current best's block number
-            best_hotkey = _uid_to_hotkey.get(best_uid)
-            best_block = (
-                first_mover_data[best_hotkey][1]
-                if best_hotkey and best_hotkey in first_mover_data
+        # Build (uid, score, block_number) tuples, sorted by block asc
+        uid_entries = []
+        for uid, score in scores.items():
+            hk = _uid_to_hotkey.get(uid)
+            block = (
+                first_mover_data[hk][1]
+                if hk and hk in first_mover_data
                 else float("inf")
             )
+            uid_entries.append((uid, score, block))
 
-            for hotkey, (_, ts) in sorted(
-                first_mover_data.items(),
-                key=lambda x: x[1][1]  # Sort by block number (ascending)
-            ):
-                # Only earlier submitters can block the current best
-                if ts >= best_block:
-                    continue
+        uid_entries.sort(key=lambda e: e[2])  # earliest first
 
-                # Reverse-lookup: find the UID currently using this hotkey
-                uid = next(
-                    (u for u, hk in _uid_to_hotkey.items() if hk == hotkey),
-                    None,
-                )
-                if uid is not None and uid in scores:
-                    # Use current score (not historical best) for protection
-                    # threshold so stale packs lose protection naturally.
-                    current = scores[uid]
-                    required_score = current + delta
-                    if best_score <= required_score:
-                        logger.info(
-                            f"First-mover protection: Miner {uid} (score={current:.3f}) "
-                            f"blocks Miner {best_uid} (score={best_score:.3f}, "
-                            f"required={required_score:.3f})"
-                        )
-                        best_uid = uid
-                        best_score = current
-                        break
+        # The earliest miner is the initial champion
+        best_uid, best_score, _ = uid_entries[0]
+
+        for uid, score, _ in uid_entries[1:]:
+            # Consensus epsilon: scores within ε are treated as tied,
+            # and the earlier miner (current champion) keeps the crown.
+            if score > best_score + eps:
+                # Challenger must also beat δ threshold
+                if score > best_score + delta:
+                    logger.info(
+                        f"First-mover overtake: Miner {uid} (score={score:.3f}) "
+                        f"beats champion Miner {best_uid} (score={best_score:.3f}, "
+                        f"required>{best_score + delta:.3f})"
+                    )
+                    best_uid = uid
+                    best_score = score
 
         # Winner takes all
         weights = {uid: 0.0 for uid in scores.keys()}
@@ -297,6 +268,141 @@ class TrajectoryScorer:
         logger.info(
             f"Winner-take-all: Miner {best_uid} wins with score {best_score:.3f} "
             f"(delta={delta}, ε={eps})"
+        )
+
+        return weights
+
+    def select_winner_by_cost(
+        self,
+        costs: Dict[int, float],
+        qualified: Dict[int, bool],
+        first_mover_data: Dict[str, Tuple[float, float]],
+        cost_delta: float = 0.10,
+        num_active_miners: Optional[int] = None,
+        uid_to_hotkey: Optional[Dict[int, str]] = None,
+    ) -> Dict[int, float]:
+        """Select winner by lowest cost, with qualification gate.
+
+        Only qualified miners (all safety + correctness checks passed)
+        compete. Among qualified miners, the one with lowest cost wins.
+        A challenger must be at least cost_delta (10%) cheaper than the
+        current champion to dethrone them (multiplicative first-mover
+        protection).
+
+        Args:
+            costs: Dict of miner_uid -> cost_usd
+            qualified: Dict of miner_uid -> bool (gate pass)
+            first_mover_data: Dict of hotkey -> (best_cost, block_number)
+            cost_delta: Multiplicative threshold (challenger < champion * (1 - delta))
+            num_active_miners: Total active miners for bootstrap check
+            uid_to_hotkey: Dict of miner_uid -> hotkey
+
+        Returns:
+            Dict of miner_uid -> weight (sums to 1.0)
+        """
+        if not costs:
+            return {}
+
+        _uid_to_hotkey = uid_to_hotkey or {}
+
+        # Filter to qualified miners only
+        qualified_uids = {uid for uid, q in qualified.items() if q}
+        qualified_costs = {uid: c for uid, c in costs.items() if uid in qualified_uids}
+
+        if not qualified_costs:
+            logger.warning("No qualified miners — all disqualified by gate")
+            return {uid: 0.0 for uid in costs}
+
+        n_miners = num_active_miners if num_active_miners is not None else len(qualified_costs)
+
+        # Bootstrap phase: graduated rewards
+        if n_miners < self.bootstrap_threshold:
+            return self._bootstrap_weights_by_cost(
+                qualified_costs, first_mover_data, _uid_to_hotkey, costs,
+            )
+
+        # Steady-state: winner-take-all by lowest cost
+        # Build (uid, cost, block_number) tuples, sorted by block asc
+        uid_entries = []
+        for uid, cost in qualified_costs.items():
+            hk = _uid_to_hotkey.get(uid)
+            block = (
+                first_mover_data[hk][1]
+                if hk and hk in first_mover_data
+                else float("inf")
+            )
+            uid_entries.append((uid, cost, block))
+
+        uid_entries.sort(key=lambda e: e[2])  # earliest first
+
+        # Earliest qualified miner is the initial champion
+        best_uid, best_cost, _ = uid_entries[0]
+
+        for uid, cost, _ in uid_entries[1:]:
+            # Challenger must be significantly cheaper (multiplicative delta)
+            if cost < best_cost * (1 - cost_delta):
+                logger.info(
+                    f"Cost overtake: Miner {uid} (${cost:.4f}) beats "
+                    f"champion Miner {best_uid} (${best_cost:.4f}, "
+                    f"required<${best_cost * (1 - cost_delta):.4f})"
+                )
+                best_uid = uid
+                best_cost = cost
+
+        # Winner takes all; disqualified miners get 0
+        weights = {uid: 0.0 for uid in costs}
+        weights[best_uid] = 1.0
+
+        logger.info(
+            f"Cost winner-take-all: Miner {best_uid} wins with "
+            f"cost=${best_cost:.4f} (delta={cost_delta})"
+        )
+
+        return weights
+
+    def _bootstrap_weights_by_cost(
+        self,
+        qualified_costs: Dict[int, float],
+        first_mover_data: Dict[str, Tuple[float, float]],
+        uid_to_hotkey: Dict[int, str],
+        all_costs: Dict[int, float],
+    ) -> Dict[int, float]:
+        """Graduated reward curve for bootstrap phase, ranked by cost.
+
+        Top-3 lowest-cost qualified miners receive 70% / 20% / 10%.
+        Ties broken by earliest block number.
+
+        Args:
+            qualified_costs: Qualified miner_uid -> cost
+            first_mover_data: hotkey -> (best_cost, block_number)
+            uid_to_hotkey: miner_uid -> hotkey
+            all_costs: All miner costs (for zero-weight entries)
+
+        Returns:
+            Dict of miner_uid -> weight (sums to 1.0)
+        """
+        BOOTSTRAP_SHARES = [0.70, 0.20, 0.10]
+
+        # Sort by cost asc (lowest first), break ties by earliest block
+        def sort_key(uid: int) -> Tuple[float, float]:
+            hk = uid_to_hotkey.get(uid)
+            ts = first_mover_data[hk][1] if hk and hk in first_mover_data else float("inf")
+            return (qualified_costs[uid], ts)
+
+        ranked = sorted(qualified_costs.keys(), key=sort_key)
+
+        weights = {uid: 0.0 for uid in all_costs}
+        for i, uid in enumerate(ranked):
+            if i < len(BOOTSTRAP_SHARES):
+                weights[uid] = BOOTSTRAP_SHARES[i]
+
+        total = sum(weights.values())
+        if total > 0 and total != 1.0:
+            weights = {uid: w / total for uid, w in weights.items()}
+
+        logger.info(
+            f"Bootstrap cost phase ({len(qualified_costs)} qualified miners): "
+            f"graduated rewards {dict((uid, w) for uid, w in weights.items() if w > 0)}"
         )
 
         return weights
@@ -346,43 +452,3 @@ class TrajectoryScorer:
         )
 
         return weights
-
-    def normalize_scores_to_weights(
-        self,
-        scores: Dict[int, float],
-        temperature: float = 0.1
-    ) -> Dict[int, float]:
-        """Normalize miner scores to weights using softmax.
-
-        DEPRECATED: Use select_winner() for winner-take-all mechanism.
-
-        Args:
-            scores: Dict of miner_uid -> score [0, 1]
-            temperature: Softmax temperature (lower = more concentrated)
-
-        Returns:
-            Dict of miner_uid -> weight (sums to 1.0)
-        """
-        logger.warning(
-            "normalize_scores_to_weights() is DEPRECATED. "
-            "Use select_winner() for winner-take-all mechanism."
-        )
-
-        if not scores:
-            return {}
-
-        uids = list(scores.keys())
-        raw_scores = np.array([scores[uid] for uid in uids])
-
-        # Softmax normalization
-        exp_scores = np.exp(raw_scores / temperature)
-        weights = exp_scores / exp_scores.sum()
-
-        result = {uid: float(w) for uid, w in zip(uids, weights)}
-
-        logger.info(
-            f"Normalized {len(scores)} scores to weights "
-            f"(temp={temperature}, spread={weights.std():.3f})"
-        )
-
-        return result

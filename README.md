@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Bittensor](https://img.shields.io/badge/bittensor-7.0+-green.svg)](https://github.com/opentensor/bittensor)
 
-> **Status: Cold-Start Phase** — The subnet is bootstrapping. Validators are setting weights to anchor consensus. Full ClawBench evaluation is coming soon. Miners can register and prepare packs now.
+> **Status: Shadow Mode** — Validators are running real ClawBench evaluations and scoring miners, but weights are set to the subnet owner (UID 74) until stable behavior is confirmed. Miners can submit packs now — submissions are evaluated but rewards are not live yet.
 
 TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent policies for real-world tasks. Validators evaluate policy packs using deterministic scenarios, rewarding agents that are **safe**, **efficient**, and **reliable**.
 
@@ -18,11 +18,11 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 │                                                              │
 │  MINERS                              VALIDATORS              │
 │  ┌───────────────┐                   ┌───────────────────┐   │
-│  │ Publish       │   on-chain        │ Read commitments  │   │
+│  │ Upload        │   on-chain        │ Read commitments  │   │
 │  │ pack.json to  │   commitment      │ from chain        │   │
-│  │ public GitHub │──────────────────▶│                   │   │
-│  │ repo          │                   │ Fetch packs from  │   │
-│  └───────────────┘                   │ GitHub, verify    │   │
+│  │ public HTTP   │─────────────────> │                   │   │
+│  │ endpoint      │                   │ Fetch packs via   │   │
+│  └───────────────┘                   │ HTTP, verify      │   │
 │        │                             │ hash + timestamp  │   │
 │        │                             │                   │   │
 │        │                             │ Evaluate via      │   │
@@ -38,13 +38,30 @@ TrajectoryRL is a Bittensor subnet where miners compete to optimize AI agent pol
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **No server required** — Miners publish packs to GitHub and commit metadata on-chain. No public IP, no uptime needed.
+- **No server required** — Miners upload packs to any HTTP endpoint and commit metadata on-chain. No public IP, no uptime needed.
 - **Deterministic evaluation** — [ClawBench](https://github.com/trajectoryRL/clawbench) scenarios with fixed fixtures and regex scoring (no LLM-as-judge randomness)
 - **Content-addressed** — Packs identified by SHA256 hash, verified against on-chain commitment
 - **Winner-take-all** — Best miner gets 100% of rewards; first-mover advantage protects early innovators
-- **Anti-copy** — GitHub push timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
+- **Anti-copy** — On-chain block timestamps + NCD similarity detection + first-mover threshold (delta=0.05)
 
 See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, and anti-gaming details.
+
+### Example ROI (1,000 tasks/day)
+
+```
+Unoptimized GLM-5:                       $12,300/month
+
+Stage 1 — Prompt optimization (AGENTS.md tuning):
+  Optimized prompts + stop rules:         $3,300/month  (73% reduction)
+
+Stage 2 — Hybrid routing (AGENTS.md + injected skills):
+  Multi-LLM dynamic routing:               $900/month  (93% reduction)
+    ├─ Qwen 3.5 (Alibaba) handles 40% of sub-tasks (tool calls, lookups)
+    ├─ GLM-5 (Z.ai) handles 25% (structured extraction, formatting)
+    ├─ Gemini 3 Flash (Google) handles 20% (search, summarization)
+    ├─ GPT-5.2 (OpenAI) handles 10% (reasoning, drafting)
+    └─ Claude Opus 4.6 (Anthropic) handles 5% (complex judgment calls)
+```
 
 ## Quick Start
 
@@ -52,23 +69,7 @@ See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full scoring, rewards, 
 
 Validators run via Docker with automatic updates from GHCR via Watchtower. When new code is pushed to `prod`, GitHub Actions builds a new image and Watchtower auto-pulls and restarts within 5 minutes.
 
-```bash
-# 1. Create .env.validator
-cat > .env.validator <<'EOF'
-WALLET_NAME=your-wallet
-WALLET_HOTKEY=default
-NETUID=11
-NETWORK=finney
-EOF
-
-# 2. Start validator + Watchtower (auto-updates from GHCR)
-docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
-
-# 3. View logs
-docker compose -f docker/docker-compose.validator.yml logs -f validator
-```
-
-**Prerequisites** (one-time setup on the host, before starting Docker):
+#### 1. Prerequisites (one-time)
 
 ```bash
 # Install btcli
@@ -84,17 +85,102 @@ btcli subnets register --wallet-name my-validator --hotkey default --netuid 11
 btcli stake add --wallet-name my-validator --hotkey default --netuid 11 --amount 100
 ```
 
-The Docker container uses the bittensor Python SDK to set weights — it reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
+#### 2. Configure environment
+
+```bash
+cat > .env.validator <<'EOF'
+WALLET_NAME=my-validator
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+CLAWBENCH_LLM_API_KEY=your-api-key
+CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1
+CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5-TEE
+EOF
+```
+
+| Variable | Required | Description |
+|----------|:--------:|-------------|
+| `WALLET_NAME` | Yes | Bittensor wallet name |
+| `WALLET_HOTKEY` | Yes | Hotkey name (usually `default`) |
+| `NETUID` | Yes | Subnet UID (`11`) |
+| `NETWORK` | Yes | `finney`, `test`, or `local` |
+| `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Chutes](https://chutes.ai)) |
+| `CLAWBENCH_LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible API |
+| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `chutes/zai-org/GLM-5-TEE`) |
+
+#### 3. Start validator
+
+```bash
+# Start validator + Watchtower (auto-updates from GHCR)
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d
+
+# View logs
+docker compose -f docker/docker-compose.validator.yml logs -f validator
+```
+
+The Docker container reads wallet keyfiles from the mounted `~/.bittensor/wallets/` directory. No btcli is needed inside the container.
+
+See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost model, auto-update details, and operational guidance.
 
 ### For Miners
 
-> **WIP** — Mining is not live yet. The evaluation pipeline is being activated. Miners can register and prepare packs now, but submissions are not being scored during the cold-start phase.
+Mining means writing **policy packs** — system prompts, tool usage rules, and stop conditions — that make AI agents perform tasks safely and cheaply. No GPU, no server, no uptime required.
 
-See [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md) for full details on how packs are evaluated and scored.
+#### 1. Prerequisites (one-time)
+
+```bash
+pip install bittensor-cli
+
+btcli wallet create --wallet-name my-miner
+btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
+```
+
+#### 2. Quick test (demo mode)
+
+```bash
+git clone https://github.com/trajectoryRL/trajectoryRL.git
+cd trajectoryRL
+pip install -e .
+
+# Submit a sample pack to verify wallet + on-chain setup
+python neurons/miner.py run --mode demo
+```
+
+#### 3. Write your own pack
+
+```bash
+# Build a pack from your AGENTS.md
+python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
+
+# Upload pack.json to any public URL, then submit
+python neurons/miner.py submit https://your-server.com/pack.json
+
+# Check status
+python neurons/miner.py status
+```
+
+#### 4. Local testing with ClawBench
+
+```bash
+cd clawbench
+pip install -e .
+# Set CLAWBENCH_LLM_API_KEY, CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL in .env
+
+# Test a single scenario
+python scripts/run_episode.py --scenario inbox_triage --variant optimized --json
+
+# Test all scenarios
+python scripts/run_batch.py
+```
+
+See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for full details: automated mode, S3 upload, pack format, and scoring targets.
 
 ## Documentation
 
 - **[Incentive Mechanism](INCENTIVE_MECHANISM.md)** — Scoring, rewards, winner-take-all, and anti-copy protection
+- **[Validator Operations](VALIDATOR_OPERATIONS.md)** — Cost model, auto-updates, and operational guidance
+- **[Miner Operations](MINER_OPERATIONS.md)** — Pack format, run modes, local testing, and submission workflow
 - **[ClawBench](https://github.com/trajectoryRL/clawbench)** — Evaluation framework (scenarios, fixtures, scoring)
 
 ## Community

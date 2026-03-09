@@ -1,13 +1,12 @@
-"""Tests for TrajectoryRL miner: pack building, validation, commitment formatting."""
+"""Tests for TrajectoryRL miner: pack building, validation, commitment formatting, daemon."""
 
 import hashlib
 import json
 import os
-import subprocess
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import bittensor as bt
 import pytest
 
 from trajectoryrl.base.miner import TrajectoryMiner
@@ -220,73 +219,67 @@ class TestCommitmentFormat:
     """Tests for format_commitment."""
 
     def test_basic_format(self):
-        """Standard commitment formatting."""
+        """Standard commitment formatting with HTTP URL."""
         c = TrajectoryMiner.format_commitment(
             pack_hash="a" * 64,
-            git_commit_hash="b" * 40,
-            repo="alice/my-pack",
+            pack_url="https://trajrl.com/samples/pack.json",
         )
-        assert c == "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        assert c == "a" * 64 + "|https://trajrl.com/samples/pack.json"
 
-    def test_full_url_shortened(self):
-        """Full GitHub URL is shortened to owner/repo."""
+    def test_https_url(self):
+        """HTTPS URL with path works."""
         c = TrajectoryMiner.format_commitment(
             pack_hash="a" * 64,
-            git_commit_hash="b" * 40,
-            repo="https://github.com/alice/my-pack",
+            pack_url="https://cdn.example.com/packs/v1/pack.json",
         )
-        assert c.endswith("|alice/my-pack")
+        assert "|https://cdn.example.com/packs/v1/pack.json" in c
 
-    def test_strips_trailing_slash(self):
-        """Trailing slash is stripped from repo."""
+    def test_http_url(self):
+        """Plain HTTP URL works."""
         c = TrajectoryMiner.format_commitment(
             pack_hash="a" * 64,
-            git_commit_hash="b" * 40,
-            repo="alice/my-pack/",
+            pack_url="http://example.com/pack.json",
         )
-        assert c.endswith("|alice/my-pack")
-
-    def test_strips_dot_git(self):
-        """Trailing .git is stripped from repo."""
-        c = TrajectoryMiner.format_commitment(
-            pack_hash="a" * 64,
-            git_commit_hash="b" * 40,
-            repo="https://github.com/alice/my-pack.git",
-        )
-        assert c.endswith("|alice/my-pack")
+        assert "|http://example.com/pack.json" in c
 
     def test_roundtrip_with_parser(self):
         """Commitment round-trips through parse_commitment."""
         from trajectoryrl.utils.commitments import parse_commitment
 
+        url = "https://trajrl.com/samples/pack.json"
         c = TrajectoryMiner.format_commitment(
             pack_hash="a" * 64,
-            git_commit_hash="b" * 40,
-            repo="alice/my-pack",
+            pack_url=url,
         )
         parsed = parse_commitment(c)
         assert parsed is not None
-        pack_hash, git_commit, repo_url = parsed
+        pack_hash, pack_url = parsed
         assert pack_hash == "a" * 64
-        assert git_commit == "b" * 40
-        assert repo_url == "https://github.com/alice/my-pack"
+        assert pack_url == url
 
     def test_invalid_pack_hash_length(self):
         """Short pack hash raises ValueError."""
         with pytest.raises(ValueError, match="64 hex chars"):
             TrajectoryMiner.format_commitment(
                 pack_hash="a" * 63,
-                git_commit_hash="b" * 40,
-                repo="alice/my-pack",
+                pack_url="https://trajrl.com/samples/pack.json",
             )
 
-    def test_invalid_git_commit_length(self):
-        """Short git commit raises ValueError."""
-        with pytest.raises(ValueError, match="40 hex chars"):
+    def test_invalid_url_scheme(self):
+        """Non-HTTP URL raises ValueError."""
+        with pytest.raises(ValueError, match="HTTP"):
             TrajectoryMiner.format_commitment(
                 pack_hash="a" * 64,
-                git_commit_hash="b" * 39,
-                repo="alice/my-pack",
+                pack_url="ftp://example.com/pack.json",
+            )
+
+    def test_too_long_url_raises(self):
+        """URL that exceeds 256-byte commitment limit raises ValueError."""
+        long_url = "https://example.com/" + "a" * 300
+        with pytest.raises(ValueError, match="too long"):
+            TrajectoryMiner.format_commitment(
+                pack_hash="a" * 64,
+                pack_url=long_url,
             )
 
 
@@ -320,15 +313,13 @@ class TestSubmitWorkflow:
             return miner
 
     def test_submit_valid_pack(self):
-        """Submit succeeds with valid pack and git info."""
+        """Submit succeeds with valid pack and URL."""
         miner = self._make_miner()
         pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
-        pack_hash = TrajectoryMiner.compute_pack_hash(pack)
 
         success = miner.submit(
             pack=pack,
-            repo="alice/my-pack",
-            git_commit="b" * 40,
+            pack_url="https://trajrl.com/samples/pack.json",
         )
         assert success
         miner._subtensor.set_commitment.assert_called_once()
@@ -340,83 +331,10 @@ class TestSubmitWorkflow:
 
         success = miner.submit(
             pack=pack,
-            repo="alice/my-pack",
-            git_commit="b" * 40,
+            pack_url="https://trajrl.com/samples/pack.json",
         )
         assert not success
         miner._subtensor.set_commitment.assert_not_called()
-
-    def test_submit_no_commit_no_repo_path_fails(self):
-        """Submit fails if neither git_commit nor repo_path provided."""
-        miner = self._make_miner()
-        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
-
-        success = miner.submit(
-            pack=pack,
-            repo="alice/my-pack",
-            git_commit=None,
-            repo_path=None,
-        )
-        assert not success
-
-
-# ===================================================================
-# Git Push Helper
-# ===================================================================
-
-
-class TestGitPush:
-    """Tests for git_push_pack."""
-
-    def test_not_a_repo_returns_none(self, tmp_path):
-        """Non-git directory returns None."""
-        pack = TrajectoryMiner.build_pack(agents_md="# Test")
-        result = TrajectoryMiner.git_push_pack(pack, str(tmp_path))
-        assert result is None
-
-    def test_writes_pack_json(self, tmp_path):
-        """Pack is written to repo as pack.json."""
-        # Init a real git repo
-        subprocess.run(
-            ["git", "init"], cwd=tmp_path, capture_output=True, check=True
-        )
-        subprocess.run(
-            ["git", "config", "user.email", "test@test.com"],
-            cwd=tmp_path, capture_output=True, check=True,
-        )
-        subprocess.run(
-            ["git", "config", "user.name", "Test"],
-            cwd=tmp_path, capture_output=True, check=True,
-        )
-        # Create initial commit so HEAD exists
-        (tmp_path / "README.md").write_text("init")
-        subprocess.run(
-            ["git", "add", "README.md"],
-            cwd=tmp_path, capture_output=True, check=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-m", "init"],
-            cwd=tmp_path, capture_output=True, check=True,
-        )
-
-        pack = TrajectoryMiner.build_pack(agents_md="# Test Policy")
-
-        # This will commit but fail on push (no remote) — that's OK for this test
-        # We patch subprocess to check the pack.json was written
-        with patch("trajectoryrl.base.miner.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0, stdout=b"abc123def456" * 4 + b"\n",
-            )
-            mock_run.return_value.stdout = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n"
-
-            # Write the files manually (since subprocess is mocked)
-            pack_path = tmp_path / "pack.json"
-            canonical = json.dumps(pack, sort_keys=True, indent=2)
-            pack_path.write_text(canonical)
-
-        assert (tmp_path / "pack.json").exists()
-        loaded = json.loads((tmp_path / "pack.json").read_text())
-        assert loaded["files"]["AGENTS.md"] == "# Test Policy"
 
 
 # ===================================================================
@@ -447,7 +365,7 @@ class TestStatus:
 
     def test_existing_commitment(self):
         """Returns raw commitment string when set."""
-        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
 
         with patch("trajectoryrl.base.miner.bt") as mock_bt:
             mock_wallet = MagicMock()
@@ -479,7 +397,6 @@ class TestMinerCLI:
     def test_build_help(self):
         """Build subcommand parses without error."""
         import neurons.miner as cli
-        # Just test that main() returns 0 with no args
         import sys
         with patch.object(sys, "argv", ["miner.py"]):
             result = cli.main()
@@ -503,7 +420,6 @@ class TestMinerCLI:
         """Validate subcommand catches invalid pack."""
         import neurons.miner as cli
 
-        # Missing AGENTS.md
         bad_pack = {
             "schema_version": 1,
             "files": {},
@@ -523,3 +439,185 @@ class TestMinerCLI:
 
         result = cli.cmd_validate(args)
         assert result == 1
+
+
+# ===================================================================
+# Tiered Exception Handling
+# ===================================================================
+
+
+class TestSubmitExceptions:
+    """Tests for tiered exception handling in submit_commitment/get_current_commitment."""
+
+    def _make_miner(self):
+        miner = TrajectoryMiner(
+            wallet_name="test", wallet_hotkey="default",
+            netuid=11, network="test",
+        )
+        miner._wallet = MagicMock()
+        miner._subtensor = MagicMock()
+        return miner
+
+    def test_not_registered_error(self):
+        """NotRegisteredError produces actionable btcli guidance."""
+        miner = self._make_miner()
+        miner._subtensor.set_commitment.side_effect = bt.NotRegisteredError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.submit_commitment(
+                "a" * 64, "https://trajrl.com/samples/pack.json"
+            )
+            assert result is False
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "not registered" in log_msg.lower()
+            assert "btcli subnet register" in log_msg
+
+    def test_chain_connection_error(self):
+        """ChainConnectionError produces connectivity guidance."""
+        miner = self._make_miner()
+        miner._subtensor.set_commitment.side_effect = bt.ChainConnectionError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.submit_commitment(
+                "a" * 64, "https://trajrl.com/samples/pack.json"
+            )
+            assert result is False
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "connect" in log_msg.lower()
+
+    def test_get_commitment_chain_error(self):
+        """get_current_commitment handles ChainConnectionError gracefully."""
+        miner = self._make_miner()
+        miner._wallet.hotkey.ss58_address = "5FakeKey"
+        miner._subtensor.get_all_commitments.side_effect = bt.ChainConnectionError()
+
+        with patch("trajectoryrl.base.miner.logger") as mock_logger:
+            result = miner.get_current_commitment()
+            assert result is None
+            log_msg = mock_logger.error.call_args[0][0]
+            assert "connect" in log_msg.lower()
+
+
+# ===================================================================
+# Daemon Mode
+# ===================================================================
+
+
+class TestDaemonEntryPoint:
+    """Tests for daemon mode detection in main()."""
+
+    def test_no_subcommand_with_pack_url_runs_daemon(self):
+        """PACK_URL set + no subcommand → daemon called."""
+        import sys
+        import neurons.miner as cli
+
+        env = {
+            "PACK_URL": "https://trajrl.com/samples/pack.json",
+            "PACK_PATH": "/tmp/pack.json",
+        }
+        mock_daemon = MagicMock(return_value="sentinel")
+        with (
+            patch.object(sys, "argv", ["miner.py"]),
+            patch.dict(os.environ, env, clear=False),
+            patch("neurons.miner._run_daemon", new=mock_daemon),
+            patch("neurons.miner.asyncio.run", return_value=None) as mock_arun,
+        ):
+            cli.main()
+            mock_daemon.assert_called_once()
+            mock_arun.assert_called_once_with("sentinel")
+
+    def test_no_subcommand_without_pack_url_shows_help(self, capsys):
+        """No PACK_URL → help text with hint."""
+        import sys
+        import neurons.miner as cli
+
+        with (
+            patch.object(sys, "argv", ["miner.py"]),
+            patch.dict(os.environ, {"PACK_URL": ""}, clear=False),
+        ):
+            result = cli.main()
+            assert result == 0
+            captured = capsys.readouterr()
+            assert "hint" in captured.out.lower()
+
+
+class TestLoadOrBuildPack:
+    """Tests for _load_or_build_pack helper."""
+
+    def test_load_from_pack_path(self, tmp_path):
+        """Loads pack.json when pack_path is set."""
+        from neurons.miner import _load_or_build_pack
+
+        pack = TrajectoryMiner.build_pack(agents_md="# Policy\nBe safe.")
+        pack_path = str(tmp_path / "pack.json")
+        TrajectoryMiner.save_pack(pack, pack_path)
+
+        config = MagicMock()
+        config.pack_path = pack_path
+        config.agents_md_path = None
+
+        result = _load_or_build_pack(config)
+        assert result is not None
+        assert result["files"]["AGENTS.md"] == "# Policy\nBe safe."
+
+    def test_build_from_agents_md(self, tmp_path):
+        """Builds pack from AGENTS.md when agents_md_path is set."""
+        from neurons.miner import _load_or_build_pack
+
+        agents_file = tmp_path / "AGENTS.md"
+        agents_file.write_text("# File Policy\nDo things.")
+
+        config = MagicMock()
+        config.pack_path = None
+        config.agents_md_path = str(agents_file)
+
+        result = _load_or_build_pack(config)
+        assert result is not None
+        assert "File Policy" in result["files"]["AGENTS.md"]
+
+    def test_missing_file_returns_none(self):
+        """Missing file → None."""
+        from neurons.miner import _load_or_build_pack
+
+        config = MagicMock()
+        config.pack_path = "/tmp/does_not_exist_99999.json"
+        config.agents_md_path = None
+
+        result = _load_or_build_pack(config)
+        assert result is None
+
+
+class TestVerifyOnchain:
+    """Tests for _verify_onchain helper."""
+
+    def test_mismatch_logs_warning(self):
+        """Hash mismatch → returns False."""
+        from neurons.miner import _verify_onchain
+
+        miner = MagicMock()
+        commitment = "a" * 64 + "|https://trajrl.com/samples/pack.json"
+        miner.get_current_commitment.return_value = commitment
+
+        result = _verify_onchain(miner, "c" * 64)
+        assert result is False
+
+    def test_match_returns_true(self):
+        """Matching hash → returns True."""
+        from neurons.miner import _verify_onchain
+
+        miner = MagicMock()
+        commitment = "a" * 64 + "|https://trajrl.com/samples/pack.json"
+        miner.get_current_commitment.return_value = commitment
+
+        result = _verify_onchain(miner, "a" * 64)
+        assert result is True
+
+    def test_no_commitment_returns_false(self):
+        """No on-chain commitment → returns False."""
+        from neurons.miner import _verify_onchain
+
+        miner = MagicMock()
+        miner.get_current_commitment.return_value = None
+
+        result = _verify_onchain(miner, "a" * 64)
+        assert result is False

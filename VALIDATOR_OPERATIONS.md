@@ -1,7 +1,7 @@
 # Validator Operations Guide
 
 **Subnet**: SN11 (TrajectoryRL)
-**Date**: 2026-02-23
+**Date**: 2026-03-06
 
 > Operational guidance for running a TrajectoryRL validator. For mechanism design and scoring rules, see [INCENTIVE_MECHANISM.md](INCENTIVE_MECHANISM.md).
 
@@ -15,62 +15,55 @@ This is by design: miners compete on *intelligence* (better prompts/policies), n
 
 ## Validator Cost Model
 
-Each epoch, a validator evaluates every active miner whose pack has changed since last evaluation:
+Each eval_interval (24h), a validator evaluates active miners marked for re-evaluation — either their `pack_hash` changed or `eval_interval` has elapsed since last eval:
 
 ```
-episodes_per_new_miner = scenarios(5) × 1 run each = 5 per miner
-epochs_per_day         = 24h / epoch_interval(24h) = 1
-episodes_per_day       = new_or_changed_miners × 5
+episodes_per_eval      = scenarios(5) × 1 run each = 5 per miner
+max_evals_per_day      = 24h / eval_interval(24h) = 1
+episodes_per_day       = marked_miners × 5
 ```
 
-> **Score persistence**: Validators only re-evaluate a miner when their `pack_hash` changes. Unchanged packs carry forward their cached score at zero cost. In steady state, most epochs evaluate only 0-2 new submissions.
+> **EMA accumulation**: Validators re-evaluate packs periodically (even if unchanged) to accumulate per-scenario EMA samples and smooth out LLM non-determinism. Rate-limited to at most 1 eval per miner per eval_interval.
 
-**Per-episode token estimate** (averaged across 5 scenarios):
+**Observed cost per episode** (median across 5 scenarios, multi-turn agent conversations):
 
-| Component | Tokens |
-|-----------|--------|
-| System prompt (miner's AGENTS.md) | ~300 |
-| User message | ~80 |
-| Workspace context (USER.md) | ~220 |
-| Fixture data (emails, calendar, tasks) | ~1,600 |
-| **Total input** | **~2,200** |
-| **Output (agent response)** | **~900** |
+Agents typically make 2–8 LLM calls per episode depending on scenario complexity. Observed cost range: **$0.05–$0.13** per episode, median **~$0.08**.
 
 ## Daily Cost Projections
 
-Designated model: `anthropic/claude-sonnet-4-5-20250929` ($3/M input, $15/M output). Cost per episode ≈ **$0.020**. Will switch to `claude-sonnet-4-6` once OpenClaw supports it (same pricing).
+Designated model: `GLM-5` via OpenAI-compatible API. Cost per episode ≈ **$0.08** (observed median).
 
 **All validators must use the designated model.** This is a consensus requirement: if validators use different models, agents produce different tool-call sequences, leading to different rubric outcomes and validator disagreement on scores. Using the wrong model puts your validator out of consensus and risks down-weighting by Yuma.
 
-### Worst-case: all miners submit new packs every epoch
+### Worst-case: all miners re-evaluated every eval_interval
 
 | Active Miners | Episodes/day | Daily Cost | Monthly Cost |
 |:-------------:|:------------:|:----------:|:------------:|
-| 5 | 25 | **$0.50** | **$15** |
-| 14 | 70 | **$1.40** | **$42** |
-| 30 | 150 | **$3.00** | **$90** |
-| 64 | 320 | **$6.40** | **$192** |
-| 128 | 640 | **$12.80** | **$384** |
-| 256 | 1,280 | **$25.60** | **$768** |
+| 5 | 25 | **$2** | **$60** |
+| 14 | 70 | **$6** | **$168** |
+| 30 | 150 | **$12** | **$360** |
+| 64 | 320 | **$26** | **$768** |
+| 128 | 640 | **$51** | **$1,536** |
+| 256 | 1,280 | **$102** | **$3,072** |
 
-**Worst-case formula**: `daily_cost ≈ miners × $0.10/day` (5 scenarios × $0.02/episode).
+**Worst-case formula**: `daily_cost ≈ miners × 1 eval × 5 episodes × $0.08 = miners × $0.40/day`.
 
-In practice, most epochs only re-evaluate a handful of new/changed packs. A typical day with 30 miners and 2 new submissions costs ~$0.20, not $3.00.
+In practice, only miners whose `pack_hash` changed are re-evaluated immediately. Stable packs are re-evaluated once per eval_interval (24h) for EMA accumulation.
 
 ## Miner Cost Model
 
 | Cost Item | Estimate |
 |-----------|----------|
 | Policy iteration (prompt tuning) | Engineer time only |
-| Local testing via ClawBench | ~$0.02/episode × ~50 test runs ≈ **$1/iteration** |
+| Local testing via ClawBench | ~$0.08/episode × ~50 test runs ≈ **$4/iteration** |
 | GitHub repo hosting | Free |
 | Bittensor registration | ~200 TAO (one-time) |
 | **Ongoing operational cost** | **~$0/month** |
 
 ## Cost Reduction Levers
 
-1. **Score persistence** (built-in): Validators only re-evaluate when `pack_hash` changes — unchanged packs cost zero. This is the primary cost control mechanism
-2. **24h epoch interval** (built-in): Caps evaluation to once per miner per day, even if a miner submits multiple times
+1. **Rate limiting** (built-in): At most 1 eval per miner per eval_interval (24h), regardless of how often the miner updates their commitment. Prevents API budget drain from rapid submissions
+2. **EMA convergence**: Once a pack's EMA scores stabilize, re-evaluation adds diminishing value. Future optimization: skip re-eval when EMA variance is below threshold
 3. **Prompt caching**: Anthropic prompt caching saves ~80% on input tokens (fixture data is identical across runs for the same scenario)
 
 ## Sustainability
@@ -83,96 +76,66 @@ Validators earn **subnet alpha**, not TAO directly. Alpha can be swapped for TAO
 Estimated alpha earnings (medium stake ~5k TAO, ~10% validator weight):
   ~295 alpha/day ≈ 4 TAO-equivalent at current pool rate ≈ $720/day
 
-Example (30 miners, worst-case all submit new packs):
-  Daily costs:   30 × $0.10 = $3.00/day
+Example (30 miners, worst-case all re-evaluated every interval):
+  Daily costs:   30 × $0.40 = $12/day
   Daily revenue: ~$720/day (alpha, at current pool rate)
-  Net profit:    ~$717/day (~99% margin)
+  Net profit:    ~$708/day (~98% margin)
 
-Example (30 miners, typical day with 2 new submissions):
-  Daily costs:   2 × $0.10 = $0.20/day
+Example (30 miners, typical day):
+  Daily costs:   ~$5-10/day (most packs unchanged)
   Daily revenue: ~$720/day
-  Net profit:    ~$720/day
+  Net profit:    ~$710-715/day
 ```
 
 **At current rates**, TrajectoryRL validators are highly profitable:
 
 | Scenario | Daily Cost (worst-case) | Daily Revenue (~$720 alpha) | Monthly Profit |
 |----------|:----------:|:---------------------------:|:--------------:|
-| 30 miners | $3.00 | $720 | **$21,510** |
-| 64 miners | $6.40 | $720 | **$21,408** |
-| 128 miners | $12.80 | $720 | **$21,216** |
-| 256 miners | $25.60 | $720 | **$20,832** |
+| 30 miners | $12 | $720 | **$21,240** |
+| 64 miners | $26 | $720 | **$20,820** |
+| 128 miners | $51 | $720 | **$20,070** |
+| 256 miners | $102 | $720 | **$18,540** |
 
-Even at 256 miners (worst case, all submitting new packs every day), LLM costs are only **~4%** of validator alpha revenue. In practice, costs are far lower due to score persistence.
+Even at 256 miners (worst case, all re-evaluated every eval_interval), LLM costs are only **~14%** of validator alpha revenue.
 
-**Break-even analysis**: At 256 miners ($25.60/day worst-case cost), the alpha-TAO pool rate would need to drop ~28x from current levels before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
+**Break-even analysis**: At 256 miners ($102/day worst-case cost), validators are extremely profitable at current alpha rates. The alpha-TAO pool rate would need to drop ~86% before validators become unprofitable. Note: these figures fluctuate with pool exchange rates and subnet demand.
 
-## Score Publishing
+## Weight Setting
 
-Validators publish per-UID scores to the shared `trajectoryRL/validator-scores` GitHub repo after each evaluation. This is required for stake-weighted consensus: validators that don't publish are excluded from the aggregation.
+Each validator sets weights independently based on its own evaluation data. There is no shared score repo or off-chain consensus mechanism.
 
-Validators do not have direct write access to the repo. Scores are submitted via PRs that a CI pipeline auto-merges after verifying the sr25519 payload signature inside the JSON.
+Every tempo (~72 min), the validator:
+1. Checks qualification: each miner must pass all safety and correctness checks across all scenarios
+2. Ranks qualified miners by cost (lowest $/episode wins), using EMA-smoothed costs
+3. Applies first-mover protection: a challenger must be ≥10% cheaper than the incumbent to dethrone
+4. Maps miner hotkeys to UIDs via the current metagraph
+5. Sets weights on-chain via commit-reveal
 
-Each epoch, the validator:
-1. Evaluates new/changed packs via ClawBench
-2. Creates a score file with an sr25519 signature over the payload
-3. Commits to its fork of `validator-scores`, opens a PR with the score file at `epoch-{N}/{hotkey}.json`
-4. CI verifies the payload signature, hotkey registration, stake, and JSON schema, then auto-merges
-5. Pulls all merged scores, computes stake-weighted mean
-6. Sets on-chain weights based on the consensus winner
+Cross-validator consensus is handled entirely on-chain by **YC3 (Yuma Consensus 3)** with **Liquid Alpha**, which dynamically adjusts per-bond learning rates based on how well validators agree.
 
-Every tempo (~72 min), the validator re-pulls scores, re-computes consensus, and re-submits weights. This allows consensus to converge as more validators publish their results.
-
-For full details on the shared score bucket, signed score files, and stake-weighted aggregation, see [INCENTIVE_MECHANISM.md — Validator Consensus](INCENTIVE_MECHANISM.md#validator-consensus).
+For full details on qualification gate, cost ranking, and YC3 configuration, see [INCENTIVE_MECHANISM.md — Validator Consensus](INCENTIVE_MECHANISM.md#validator-consensus).
 
 ---
 
 ## Automatic Updates
 
-Validators should run with `docker compose watch` to automatically pick up new scenarios, scoring updates, and code changes without manual container rebuilds.
+The validator image is hosted on GHCR (GitHub Container Registry). Watchtower runs alongside the validator and automatically pulls new images when updates are pushed to `prod`, typically within 5 minutes.
 
-### Starting with auto-update
+No manual action is needed — Watchtower handles image pull, container restart, and cleanup.
+
+### Verifying auto-update
 
 ```bash
-# Start all services with file watching enabled
-docker compose up --watch
+# Check Watchtower logs
+docker compose -f docker/docker-compose.validator.yml logs watchtower
+
+# Check current validator image
+docker inspect trajectoryrl_validator --format '{{.Image}}'
 ```
 
-### How it works
-
-When the team releases updates (new scenarios, scoring fixes, validator code), pull the changes:
+### Manual update (if not using Watchtower)
 
 ```bash
-git pull --recurse-submodules
-```
-
-`docker compose watch` detects the file changes and automatically applies them:
-
-| Change type | Action | Downtime |
-|-------------|--------|----------|
-| Validator source code (`trajectoryrl/`, `neurons/`) | Sync + restart | Seconds |
-| ClawBench scenarios, fixtures, scoring (`clawbench/`) | Sync + restart | Seconds |
-| Mock tools server (`clawbench/clawbench/mock_tools/`) | Sync + restart | Seconds |
-| Dependencies (`requirements.txt`, `pyproject.toml`) | Full rebuild | Minutes |
-| Dockerfile changes | Full rebuild | Minutes |
-
-### Optional: automated git pull
-
-Set up a cron job to pull updates periodically:
-
-```bash
-# Pull every 6 hours (add to crontab -e)
-0 */6 * * * cd /path/to/trajectoryrl && git pull --recurse-submodules >> /var/log/trajectoryrl-pull.log 2>&1
-```
-
-### Running without auto-update
-
-If you prefer manual control, run detached without watch:
-
-```bash
-docker compose up -d
-
-# After pulling updates, manually rebuild:
-git pull --recurse-submodules
-docker compose up -d --build
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator pull validator
+docker compose -f docker/docker-compose.validator.yml --env-file .env.validator up -d validator
 ```

@@ -91,7 +91,9 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sandbox-token-12345}
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
+      - CLAWBENCH_LLM_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - CLAWBENCH_LLM_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
     depends_on:
       init:
         condition: service_completed_successfully
@@ -126,19 +128,22 @@ services:
       - MOCK_TOOLS_URL=http://mock-tools:3001
       - OPENCLAW_URL=http://openclaw:18789
       - WORKSPACE_PATH=/workspace
-      # Evaluation (720s = 12min for local testing; production uses 86400s = 24h)
-      - EPOCH_INTERVAL=${EPOCH_INTERVAL:-720}
+      # Evaluation
+      - EVAL_INTERVAL_BLOCKS=${EVAL_INTERVAL_BLOCKS:-100}
+      - WEIGHT_INTERVAL_BLOCKS=${WEIGHT_INTERVAL_BLOCKS:-360}
+      - EMA_ALPHA=${EMA_ALPHA:-0.3}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # API keys
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # Model
-      - CLAWBENCH_MODEL=${CLAWBENCH_MODEL:-anthropic/claude-sonnet-4-5-20250929}
+      - CLAWBENCH_DEFAULT_MODEL=${CLAWBENCH_DEFAULT_MODEL:-zhipu/glm-5}
+      - CLAWBENCH_LLM_BASE_URL=${CLAWBENCH_LLM_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}
+      - CLAWBENCH_LLM_API_KEY=${CLAWBENCH_LLM_API_KEY:-}
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - workspace:/workspace
       - ./logs:/app/logs
       - /tmp/trajectoryrl_packs:/tmp/trajectoryrl_packs
-      - ./git_cache:/app/logs/git_cache
     depends_on:
       mock-tools:
         condition: service_healthy
@@ -181,37 +186,6 @@ services:
         - action: rebuild
           path: ./docker/Dockerfile.validator
 
-  # --------------------------------------------------------------------------
-  # Miner (optional): start with `docker compose --profile miner up -d`
-  # --------------------------------------------------------------------------
-  miner:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.miner
-    container_name: trajectoryrl_miner
-    restart: unless-stopped
-    environment:
-      - WALLET_NAME=${WALLET_NAME:-miner}
-      - WALLET_HOTKEY=${WALLET_HOTKEY:-default}
-      - NETUID=${NETUID:-11}
-      - NETWORK=${NETWORK:-finney}
-      - PACK_PATH=${PACK_PATH:-/app/packs/pack.json}
-      - PACK_REPO=${PACK_REPO:-}
-      - PACK_COMMIT=${PACK_COMMIT:-}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    volumes:
-      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
-      - ./packs:/app/packs:ro
-      - ./logs:/app/logs
-    networks:
-      - trajectoryrl
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    profiles:
-      - miner
 
 volumes:
   workspace:

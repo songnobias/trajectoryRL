@@ -7,9 +7,7 @@ import math
 import os
 import shutil
 import subprocess
-import tempfile
 import yaml
-from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
@@ -24,11 +22,14 @@ class EvaluationResult:
     Attributes:
         scenario_name: Name of the scenario
         score: Normalized score [0, 1]
-        success: Whether the scenario passed
+        success: Whether the scenario passed (qualification gate)
         tool_calls: Number of tool calls made
         response: Agent's final response
         rubric: Detailed scoring rubric results
         error: Error message if evaluation failed
+        cost_usd: Total episode cost in USD (None if unavailable)
+        token_usage: Token breakdown {input, output, cache_read, cache_write}
+        model_usage: Per-model cost breakdown for multi-model routing (None if single model)
     """
     scenario_name: str
     score: float
@@ -37,6 +38,9 @@ class EvaluationResult:
     response: str
     rubric: Dict[str, Any]
     error: Optional[str] = None
+    cost_usd: Optional[float] = None
+    token_usage: Optional[Dict[str, int]] = None
+    model_usage: Optional[List[Dict[str, Any]]] = None
 
 
 class ClawBenchHarness:
@@ -47,17 +51,26 @@ class ClawBenchHarness:
         clawbench_path: Path,
         timeout: int = 120,
         workspace_path: Optional[Path] = None,
+        clawbench_default_model: str = "zhipu/glm-5",
+        clawbench_api_key: str = "",
+        clawbench_base_url: str = "https://open.bigmodel.cn/api/paas/v4",
     ):
         """Initialize harness.
-
+    
         Args:
             clawbench_path: Path to clawbench directory
             timeout: Timeout in seconds for each scenario
             workspace_path: Shared workspace directory that OpenClaw reads from.
                 If None, uses WORKSPACE_PATH env var or clawbench_path/workspace.
+            clawbench_default_model: Model in ``provider/model`` format (e.g. ``zhipu/glm-5``).
+            clawbench_api_key: API key for the LLM provider.
+            clawbench_base_url: Base URL for the OpenAI-compatible API.
         """
         self.clawbench_path = clawbench_path
         self.timeout = timeout
+        self.clawbench_default_model = clawbench_default_model
+        self.clawbench_api_key = clawbench_api_key
+        self.clawbench_base_url = clawbench_base_url
         self.scripts_path = clawbench_path / "scripts"
         self.scenarios_path = clawbench_path / "scenarios"
         self.fixtures_path = clawbench_path / "fixtures"
@@ -105,29 +118,25 @@ class ClawBenchHarness:
         )
 
         try:
-            # Use an isolated workspace per evaluation to prevent concurrent
-            # evaluations from overwriting each other's pack files.
-            with tempfile.TemporaryDirectory(
-                prefix="trajectoryrl_eval_",
-                dir=self.workspace_path.parent,
-            ) as tmpdir:
-                workspace = Path(tmpdir)
-                # Write pack files so OpenClaw can read them.
-                self._apply_pack_to_workspace(
-                    pack, workspace, context_preamble
-                )
+            # Write pack files to the shared workspace that the OpenClaw
+            # Docker container actually mounts.  A previous implementation
+            # used a TemporaryDirectory for isolation, but that temp path
+            # was never mounted into the container — OpenClaw kept reading
+            # the stale default AGENTS.md, ignoring the miner's pack.
+            # Evaluations run sequentially so concurrent writes are not an
+            # issue.
+            self._apply_pack_to_workspace(
+                pack, self.workspace_path, context_preamble
+            )
 
-                # Run scenario — user_context is passed to run_episode.py which
-                # handles template substitution in workspace files and pushes
-                # context to the mock server.
-                result = await self._run_scenario(
-                    scenario_name=scenario_name,
-                    workspace=workspace,
-                    seed=seed,
-                    user_context=user_context,
-                )
+            result = await self._run_scenario(
+                scenario_name=scenario_name,
+                workspace=self.workspace_path,
+                seed=seed,
+                user_context=user_context,
+            )
 
-                return result
+            return result
 
         except Exception as e:
             logger.error(f"Evaluation failed: {e}", exc_info=True)
@@ -224,21 +233,55 @@ class ClawBenchHarness:
         # Median tool calls for stability
         tool_calls = sorted(r.tool_calls for r in valid_runs)[len(valid_runs) // 2]
 
+        # Median cost across valid runs (outlier-resistant)
+        cost_runs = [r.cost_usd for r in valid_runs if r.cost_usd is not None]
+        median_cost = None
+        if cost_runs:
+            cost_runs.sort()
+            median_cost = cost_runs[len(cost_runs) // 2]
+
+        # Median token usage across valid runs
+        median_tokens = None
+        token_runs = [r.token_usage for r in valid_runs if r.token_usage is not None]
+        if token_runs:
+            median_tokens = {}
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+                vals = sorted(t.get(key, 0) for t in token_runs)
+                median_tokens[key] = vals[len(vals) // 2]
+
+        # Majority-vote the qualification gate (success) independently.
+        # run_episode.py sets success=True only when all safety + correctness
+        # checks pass. We must preserve that strict gate semantics rather than
+        # using voted_score > 0.0, which would qualify miners that fail
+        # safety checks but pass other rubric checks.
+        success_votes = sum(1 for r in valid_runs if r.success)
+        voted_success = success_votes >= quorum
+
         # Use response from the run closest to voted score
         closest = min(valid_runs, key=lambda r: abs(r.score - voted_score))
 
+        # Per-model breakdown from the median-cost run (structural, not aggregatable)
+        median_model_usage = closest.model_usage
+
+        cost_str = f", cost=${median_cost:.4f}" if median_cost is not None else ""
+        gate_str = "PASS" if voted_success else "FAIL"
         logger.info(
-            f"Consensus result: {scenario_name} → score={voted_score:.3f} "
-            f"(individual scores: {[round(r.score, 3) for r in runs]})"
+            f"Consensus result: {scenario_name} → score={voted_score:.3f}, "
+            f"gate={gate_str}{cost_str} "
+            f"(individual scores: {[round(r.score, 3) for r in runs]}, "
+            f"gate votes: {success_votes}/{len(valid_runs)})"
         )
 
         return EvaluationResult(
             scenario_name=scenario_name,
             score=voted_score,
-            success=voted_score > 0.0,
+            success=voted_success,
             tool_calls=tool_calls,
             response=closest.response,
             rubric=voted_rubric,
+            cost_usd=median_cost,
+            token_usage=median_tokens,
+            model_usage=median_model_usage,
         )
 
     @staticmethod
@@ -348,8 +391,18 @@ class ClawBenchHarness:
             workspace: Workspace directory path
             context_preamble: Epoch context markdown prepended to AGENTS.md
         """
-        # Create workspace directory
-        workspace.mkdir(parents=True, exist_ok=True)
+        # Wipe workspace so stale files from a previous miner's pack
+        # (e.g. SOUL.md, skills/) don't leak into the next evaluation.
+        # Clear contents instead of rmtree to avoid EBUSY on Docker
+        # named-volume mount points.
+        if workspace.exists():
+            for child in workspace.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        else:
+            workspace.mkdir(parents=True, exist_ok=True)
         workspace_abs = workspace.resolve()
 
         # Write files from pack.
@@ -422,12 +475,20 @@ class ClawBenchHarness:
 
         logger.debug(f"Running command: {' '.join(cmd)}")
 
+        env = {
+            **os.environ,
+            "CLAWBENCH_DEFAULT_MODEL": self.clawbench_default_model,
+            "CLAWBENCH_LLM_API_KEY": self.clawbench_api_key,
+            "CLAWBENCH_LLM_BASE_URL": self.clawbench_base_url,
+        }
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(self.clawbench_path)
+                cwd=str(self.clawbench_path),
+                env=env,
             )
 
             stdout, stderr = await asyncio.wait_for(
@@ -435,16 +496,54 @@ class ClawBenchHarness:
                 timeout=self.timeout
             )
 
+            # Check for subprocess errors
+            if proc.returncode != 0:
+                stderr_text = stderr.decode()
+                logger.error(
+                    f"run_episode.py exited with code {proc.returncode}\n"
+                    f"stderr: {stderr_text}"
+                )
+                return EvaluationResult(
+                    scenario_name=scenario_name,
+                    score=0.0,
+                    success=False,
+                    tool_calls=0,
+                    response="",
+                    rubric={},
+                    error=f"Subprocess failed with code {proc.returncode}",
+                )
+
             # Parse JSON output
             output = stdout.decode()
             result_data = self._parse_episode_output(output)
 
             # Extract scoring results
-            score = result_data.get("score", 0.0)
+            # New format: checks_passed/checks_total (no "score" field)
+            checks_passed = result_data.get("checks_passed", 0)
+            checks_total = result_data.get("checks_total", 0)
+            score = checks_passed / checks_total if checks_total > 0 else 0.0
             success = result_data.get("success", False)
             tool_calls = result_data.get("tool_calls", 0)
             response = result_data.get("response", "")
             rubric = result_data.get("rubric", {})
+
+            # Extract cost data (optional field from run_episode.py)
+            cost_usd = None
+            token_usage = None
+            model_usage = None
+            cost_data = result_data.get("cost")
+            if cost_data and isinstance(cost_data, dict):
+                cost_usd = cost_data.get("total_usd")
+                token_usage = {
+                    "input_tokens": cost_data.get("input_tokens", 0),
+                    "output_tokens": cost_data.get("output_tokens", 0),
+                    "cache_read_tokens": cost_data.get("cache_read_tokens", 0),
+                    "cache_write_tokens": cost_data.get("cache_write_tokens", 0),
+                }
+                # Per-model breakdown for multi-model routing telemetry
+                models = cost_data.get("models")
+                if models and isinstance(models, list):
+                    model_usage = models
 
             return EvaluationResult(
                 scenario_name=scenario_name,
@@ -452,7 +551,10 @@ class ClawBenchHarness:
                 success=success,
                 tool_calls=tool_calls,
                 response=response,
-                rubric=rubric
+                rubric=rubric,
+                cost_usd=cost_usd,
+                token_usage=token_usage,
+                model_usage=model_usage,
             )
 
         except asyncio.TimeoutError:
@@ -485,8 +587,8 @@ class ClawBenchHarness:
             Parsed result dictionary
         """
         # run_episode.py outputs JSON when --json flag is used
-        # Format: {"score": 0.9, "success": true, "tool_calls": 12, ...}
-        # Scan lines in reverse; require "score" key to distinguish the
+        # Format: {"success": true, "checks_passed": 25, "checks_total": 25, ...}
+        # Scan lines in reverse; require "success" key to distinguish the
         # result object from stray JSON log lines.
         lines = output.strip().split("\n")
         for line in reversed(lines):
@@ -495,7 +597,7 @@ class ClawBenchHarness:
                 continue
             try:
                 data = json.loads(line)
-                if isinstance(data, dict) and "score" in data:
+                if isinstance(data, dict) and "success" in data:
                     return data
             except json.JSONDecodeError:
                 continue
@@ -503,8 +605,9 @@ class ClawBenchHarness:
         logger.error("Failed to parse episode output: no result JSON found")
         logger.debug(f"Output was: {output}")
         return {
-            "score": 0.0,
             "success": False,
+            "checks_passed": 0,
+            "checks_total": 0,
             "tool_calls": 0,
             "response": "",
             "rubric": {},

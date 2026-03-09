@@ -1,13 +1,14 @@
 """Tests for TrajectoryRL validator components.
 
 Tests the scoring, ClawBench harness, OPP schema validation,
-and config without requiring a live Bittensor network.
+EMA scoring, and config without requiring a live Bittensor network.
 """
 
 import asyncio
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -32,7 +33,7 @@ sys.modules["bittensor"] = _mock_bt
 from trajectoryrl.utils.clawbench import ClawBenchHarness, EvaluationResult
 from trajectoryrl.utils.opp_schema import validate_opp_schema, ValidationResult
 from trajectoryrl.scoring import TrajectoryScorer, AggregatedScore
-from trajectoryrl.utils.github import GitHubVerifier, GitVerificationResult
+from trajectoryrl.utils.github import PackFetcher, PackVerificationResult
 from trajectoryrl.base.validator import TrajectoryValidator
 from trajectoryrl.utils.epoch_context import (
     generate_epoch_context, render_context_preamble,
@@ -337,6 +338,34 @@ class TestTrajectoryScorer:
         assert weights[1] == 1.0
         assert weights[0] == 0.0
 
+    def test_select_winner_transitive_first_mover(self, scorer):
+        """First-mover protection must be transitive.
+
+        A(block 100, score=0.76), B(block 200, score=0.80), C(block 300, score=0.84).
+        - B can't beat A: 0.80 <= 0.76 + 0.05 = 0.81
+        - C can beat A: 0.84 > 0.81
+        - So C should win, NOT B.
+
+        Previously, the code found B blocks C (0.84 <= 0.85) and stopped,
+        awarding B the win even though B never legitimately beat A.
+        """
+        scores = {0: 0.76, 1: 0.80, 2: 0.84}
+        uid_to_hotkey = {0: "hk_A", 1: "hk_B", 2: "hk_C"}
+        first_mover_data = {
+            "hk_A": (0.76, 100.0),
+            "hk_B": (0.80, 200.0),
+            "hk_C": (0.84, 300.0),
+        }
+        weights = scorer.select_winner(
+            scores, first_mover_data, delta=0.05, num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # C beats A's protection (0.84 > 0.81), and B never became champion
+        assert weights[2] == 1.0, "C should win (beats A's protection)"
+        assert weights[0] == 0.0
+        assert weights[1] == 0.0
+
     def test_full_scoring_pipeline(self, scorer, sample_results):
         """End-to-end: results -> aggregate -> final score."""
         agg = scorer.aggregate_scores(sample_results)
@@ -367,16 +396,13 @@ class TestTrajectoryScorer:
         s = TrajectoryScorer(
             consensus_epsilon=0.02
         )
-        # Two miners with nearly identical scores (within ε)
+        # Two miners with nearly identical scores (within ε).
+        # Without first_mover_data, miners have no block ordering, so the
+        # iterative approach picks the first in iteration order.
+        # With first_mover_data: miner 0 submitted first (earliest),
+        # miner 1's score (0.91) is within ε of champion (0.90), so it
+        # doesn't overtake — earliest miner keeps the crown.
         scores = {0: 0.90, 1: 0.91}
-        # No first-mover data → pure epsilon tie-break
-        weights = s.select_winner(
-            scores, first_mover_data={}, delta=0.05, num_active_miners=20
-        )
-        # Without first_mover_data, no timestamps to break tie → highest score wins
-        assert weights[1] == 1.0
-
-        # Now with timestamps: miner 0 submitted first
         uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
         first_mover = {"hk_0": (0.90, 100.0), "hk_1": (0.91, 200.0)}
         # Use delta=0 to isolate epsilon behavior from first-mover protection
@@ -504,9 +530,6 @@ class TestEpochSeedAndScenarioRotation:
         seed = TrajectoryValidator.compute_epoch_seed(1)
         assert isinstance(seed, int)
         assert seed > 0
-
-    # NOTE: select_epoch_scenarios was removed in v0.2.0.
-    # All scenarios run every epoch (per INCENTIVE_MECHANISM.md v1.06).
 
 
 # ===================================================================
@@ -923,61 +946,67 @@ class TestClawBenchHarness:
         assert harness.timeout == 120
 
     def test_parse_episode_output_clean_json(self, harness):
-        output = '{"score": 0.92, "success": true, "tool_calls": 8, "response": "test", "rubric": {}}'
+        output = '{"success": true, "checks_passed": 8, "checks_total": 10, "tool_calls": 8, "response": "test", "rubric": {}}'
         result = harness._parse_episode_output(output)
-        assert result["score"] == 0.92
         assert result["success"] is True
+        assert result["checks_passed"] == 8
         assert result["tool_calls"] == 8
 
     def test_parse_episode_output_json_after_logs(self, harness):
         output = (
             "Some log line\n"
             "Another log line\n"
-            '{"score": 0.85, "success": false, "tool_calls": 3, "response": "", "rubric": {}}'
+            '{"success": false, "checks_passed": 3, "checks_total": 10, "tool_calls": 3, "response": "", "rubric": {}}'
         )
         result = harness._parse_episode_output(output)
-        assert result["score"] == 0.85
         assert result["success"] is False
+        assert result["checks_passed"] == 3
 
     def test_parse_episode_output_no_json(self, harness):
         result = harness._parse_episode_output("no json here at all")
-        assert result["score"] == 0.0
+        assert result["success"] is False
         assert "error" in result
 
     def test_parse_episode_output_invalid_json(self, harness):
         result = harness._parse_episode_output("{invalid json}")
-        assert result["score"] == 0.0
+        assert result["success"] is False
         assert "error" in result
 
     def test_parse_episode_output_empty(self, harness):
         result = harness._parse_episode_output("")
-        assert result["score"] == 0.0
+        assert result["success"] is False
         assert "error" in result
 
     def test_parse_episode_output_full_rubric(self, harness):
         """Test parsing a realistic scored output with full rubric."""
         data = {
-            "score": 0.75,
             "success": False,
+            "checks_passed": 10,
+            "checks_total": 15,
             "tool_calls": 5,
             "response": "Here is the summary...",
             "rubric": {
-                "score": 0.75,
-                "points_earned": 30,
-                "points_possible": 40,
                 "passed": 10,
-                "failed": 5,
-                "total_checks": 15,
-                "by_category": {
-                    "safety": {"earned": 12, "possible": 12, "score": 1.0},
-                    "correctness": {"earned": 10, "possible": 15, "score": 0.667},
-                },
+                "total": 15,
+                "checks": [
+                    {"id": "safety_1", "category": "safety", "passed": True},
+                    {"id": "correct_1", "category": "correctness", "passed": False},
+                ],
+                "failed_ids": ["correct_1"],
+            },
+            "cost": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_read_tokens": 200,
+                "cache_write_tokens": 100,
+                "total_usd": 0.042,
+                "model": "anthropic/claude-sonnet-4-5-20250929",
             },
         }
         output = json.dumps(data)
         result = harness._parse_episode_output(output)
-        assert result["score"] == 0.75
-        assert result["rubric"]["by_category"]["safety"]["score"] == 1.0
+        assert result["checks_passed"] == 10
+        assert result["cost"]["total_usd"] == 0.042
 
     def test_compute_hash(self, harness, valid_pack):
         h = harness._compute_hash(valid_pack)
@@ -1044,6 +1073,23 @@ class TestEvaluationResult:
         assert r.scenario_name == "test"
         assert r.score == 0.85
         assert r.error is None
+        assert r.cost_usd is None
+        assert r.token_usage is None
+
+    def test_with_cost(self):
+        r = EvaluationResult(
+            scenario_name="test",
+            score=0.85,
+            success=True,
+            tool_calls=10,
+            response="hello",
+            rubric={},
+            cost_usd=0.042,
+            token_usage={"input_tokens": 1000, "output_tokens": 500,
+                         "cache_read_tokens": 200, "cache_write_tokens": 100},
+        )
+        assert r.cost_usd == 0.042
+        assert r.token_usage["input_tokens"] == 1000
 
     def test_error_result(self):
         r = EvaluationResult(
@@ -1057,535 +1103,217 @@ class TestEvaluationResult:
         )
         assert r.error == "Timeout after 120s"
         assert r.score == 0.0
+        assert r.cost_usd is None
 
 
 # ===================================================================
-# GitHubVerifier Tests
+# PackFetcher Tests
 # ===================================================================
 
-class TestGitHubVerifier:
+class TestPackFetcher:
 
     def test_init_creates_cache_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            cache = Path(tmpdir) / "git_cache"
-            verifier = GitHubVerifier(cache_dir=cache)
+            cache = Path(tmpdir) / "pack_cache"
+            fetcher = PackFetcher(cache_dir=cache)
             assert cache.exists()
 
-    def test_init_with_token(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test123"
-            )
-            assert verifier.github_token == "ghp_test123"
-
-    def test_verify_commit_exists_invalid(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            # Non-git directory
-            result = asyncio.get_event_loop().run_until_complete(
-                verifier._verify_commit_exists(
-                    Path(tmpdir), "abc123" * 7  # fake hash
-                )
-            )
-            assert result is False
-
-    def test_get_commit_timestamp_invalid(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            result = asyncio.get_event_loop().run_until_complete(
-                verifier._get_commit_timestamp(
-                    Path(tmpdir), "abc123" * 7
-                )
-            )
-            assert result is None
-
-    # ---------------------------------------------------------------
-    # _parse_github_url
-    # ---------------------------------------------------------------
-
-    def test_parse_github_url_basic(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    def test_parse_github_url_trailing_slash(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack/"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    def test_parse_github_url_dot_git(self):
-        owner, repo = GitHubVerifier._parse_github_url(
-            "https://github.com/alice/my-pack.git"
-        )
-        assert owner == "alice"
-        assert repo == "my-pack"
-
-    # ---------------------------------------------------------------
-    # _get_push_timestamp_events_api (mocked)
-    # ---------------------------------------------------------------
-
-    def test_events_api_finds_commit_via_head(self):
-        """Events API finds commit as the head of a PushEvent (fast path)."""
-        commit_sha = "a" * 40
-
-        mock_events = [
-            {
-                "type": "CreateEvent",
-                "created_at": "2026-02-10T10:00:00Z",
-                "payload": {},
-            },
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "repository_id": 123,
-                    "push_id": 456,
-                    "ref": "refs/heads/main",
-                    "head": commit_sha,
-                    "before": "b" * 40,
-                },
-            },
-        ]
+    def test_verify_valid_pack(self):
+        """Valid pack URL + matching hash → verification passes."""
+        pack = {"schema_version": 1, "files": {"AGENTS.md": "# Test"}}
+        pack_json = json.dumps(pack, sort_keys=True)
+        pack_hash = hashlib.sha256(pack_json.encode()).hexdigest()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = mock_events
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", commit_sha)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_events_api_finds_commit_via_compare(self):
-        """Events API finds commit via Compare API when head doesn't match."""
-        commit_sha = "a" * 40
-        head_sha = "c" * 40
-        before_sha = "b" * 40
-
-        mock_events = [
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "ref": "refs/heads/main",
-                    "head": head_sha,
-                    "before": before_sha,
-                },
-            },
-        ]
-
-        # Compare API response lists commits in the push range
-        mock_compare = {
-            "commits": [
-                {"sha": commit_sha},
-                {"sha": head_sha},
-            ]
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                # Events API response
-                mock_events_resp = MagicMock()
-                mock_events_resp.status_code = 200
-                mock_events_resp.json.return_value = mock_events
-
-                # Compare API response
-                mock_compare_resp = MagicMock()
-                mock_compare_resp.status_code = 200
-                mock_compare_resp.json.return_value = mock_compare
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.side_effect = [
-                    mock_events_resp,   # events page 1
-                    mock_compare_resp,  # compare API call
-                ]
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", commit_sha)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_events_api_commit_not_found(self):
-        """Events API has no PushEvent with our commit → returns None."""
-        mock_events = [
-            {
-                "type": "PushEvent",
-                "created_at": "2026-02-15T14:30:00Z",
-                "payload": {
-                    "ref": "refs/heads/main",
-                    "head": "d" * 40,
-                    "before": "e" * 40,
-                },
-            },
-        ]
-
-        # Compare API says commit not in range
-        mock_compare = {"commits": [{"sha": "d" * 40}]}
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_events_resp = MagicMock()
-                mock_events_resp.status_code = 200
-
-                mock_compare_resp = MagicMock()
-                mock_compare_resp.status_code = 200
-                mock_compare_resp.json.return_value = mock_compare
-
-                # Page 1 returns events, page 2 returns empty
-                mock_events_resp.json.side_effect = [mock_events, []]
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.side_effect = [
-                    mock_events_resp,   # events page 1
-                    mock_compare_resp,  # compare for the push event
-                    mock_events_resp,   # events page 2 (empty)
-                ]
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    def test_events_api_rate_limited(self):
-        """Events API returns 403 rate limit → returns None gracefully."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 403
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.get.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_events_api("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    # ---------------------------------------------------------------
-    # _get_push_timestamp_graphql (mocked)
-    # ---------------------------------------------------------------
-
-    def test_graphql_returns_pushed_date(self):
-        """GraphQL API returns valid pushedDate."""
-        graphql_response = {
-            "data": {
-                "repository": {
-                    "object": {
-                        "pushedDate": "2026-02-15T14:30:00Z",
-                        "committedDate": "2026-02-15T14:28:00Z",
-                    }
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                )
-
-            assert ts is not None
-            from datetime import datetime, timezone
-            expected = datetime(2026, 2, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
-            assert abs(ts - expected) < 1
-
-    def test_graphql_detects_backdating(self):
-        """GraphQL logs warning when pushedDate diverges from committedDate."""
-        # Committed date is backdated by 1 day
-        graphql_response = {
-            "data": {
-                "repository": {
-                    "object": {
-                        "pushedDate": "2026-02-15T14:30:00Z",
-                        "committedDate": "2026-02-14T10:00:00Z",
-                    }
-                }
-            }
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                with patch("trajectoryrl.utils.github.logger") as mock_logger:
-                    ts = asyncio.get_event_loop().run_until_complete(
-                        verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                    )
-
-                    # Should still return the push timestamp
-                    assert ts is not None
-                    # Should have logged a divergence warning
-                    warning_calls = [
-                        str(c) for c in mock_logger.warning.call_args_list
-                    ]
-                    assert any("divergence" in w.lower() for w in warning_calls)
-
-    def test_graphql_commit_not_found(self):
-        """GraphQL returns null object → None."""
-        graphql_response = {
-            "data": {"repository": {"object": None}}
-        }
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
-
-            with patch("httpx.AsyncClient") as MockClient:
-                mock_resp = MagicMock()
-                mock_resp.status_code = 200
-                mock_resp.json.return_value = graphql_response
-
-                mock_client_instance = AsyncMock()
-                mock_client_instance.post.return_value = mock_resp
-                mock_client_instance.__aenter__ = AsyncMock(
-                    return_value=mock_client_instance
-                )
-                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
-                MockClient.return_value = mock_client_instance
-
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_push_timestamp_graphql("alice", "repo", "a" * 40)
-                )
-
-            assert ts is None
-
-    # ---------------------------------------------------------------
-    # _get_server_push_timestamp (orchestration)
-    # ---------------------------------------------------------------
-
-    def test_server_push_timestamp_events_api_succeeds(self):
-        """Events API succeeds → returns timestamp without trying GraphQL."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=1700000000.0,
-            ) as mock_events, patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value=pack_json,
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash=pack_hash,
                     )
                 )
 
-            assert ts == 1700000000.0
-            mock_events.assert_called_once()
-            mock_graphql.assert_not_called()  # Should not fall through
+            assert result.valid is True
+            assert result.pack_content == pack
 
-    def test_server_push_timestamp_falls_through_to_graphql(self):
-        """Events API returns None → falls through to GraphQL."""
+    def test_verify_hash_mismatch(self):
+        """Pack content doesn't match expected hash → verification fails."""
+        pack_json = json.dumps({"schema_version": 1, "files": {"AGENTS.md": "# Test"}}, sort_keys=True)
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock, return_value=1700000000.0,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value=pack_json,
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="f" * 64,
                     )
                 )
 
-            assert ts == 1700000000.0
-            mock_graphql.assert_called_once()
+            assert result.valid is False
+            assert "mismatch" in result.error.lower()
 
-    def test_server_push_timestamp_both_fail_returns_none(self):
-        """Both APIs fail → returns None (fail-safe rejection)."""
+    def test_verify_fetch_failure(self):
+        """HTTP fetch fails → verification fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token="ghp_test"
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
+                fetcher, "_fetch_pack",
                 new_callable=AsyncMock, return_value=None,
             ):
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="a" * 64,
                     )
                 )
 
-            assert ts is None
+            assert result.valid is False
+            assert "fetch" in result.error.lower() or "failed" in result.error.lower()
 
-    def test_server_push_timestamp_no_token_skips_graphql(self):
-        """No github_token → skips GraphQL entirely."""
+    def test_verify_invalid_json(self):
+        """Non-JSON response → verification fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(
-                cache_dir=Path(tmpdir), github_token=None
-            )
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
             with patch.object(
-                verifier, "_get_push_timestamp_events_api",
-                new_callable=AsyncMock, return_value=None,
-            ), patch.object(
-                verifier, "_get_push_timestamp_graphql",
-                new_callable=AsyncMock,
-            ) as mock_graphql:
-                ts = asyncio.get_event_loop().run_until_complete(
-                    verifier._get_server_push_timestamp(
-                        "https://github.com/alice/repo", "a" * 40
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock, return_value="not json {{{",
+            ):
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash="a" * 64,
                     )
                 )
 
-            assert ts is None
-            mock_graphql.assert_not_called()
+            assert result.valid is False
+            assert "json" in result.error.lower()
+
+    def test_cache_hit_skips_fetch(self):
+        """Cached pack with matching hash → no HTTP fetch needed."""
+        pack = {"schema_version": 1, "files": {"AGENTS.md": "# Cached"}}
+        pack_json = json.dumps(pack, sort_keys=True)
+        pack_hash = hashlib.sha256(pack_json.encode()).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            # Pre-populate cache
+            cache_path = Path(tmpdir) / f"{pack_hash}.json"
+            cache_path.write_text(json.dumps(pack, sort_keys=True))
+
+            with patch.object(
+                fetcher, "_fetch_pack",
+                new_callable=AsyncMock,
+            ) as mock_fetch:
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher.verify_submission(
+                        pack_url="https://trajrl.com/samples/pack.json",
+                        pack_hash=pack_hash,
+                    )
+                )
+
+            assert result.valid is True
+            assert result.pack_content == pack
+            mock_fetch.assert_not_called()
+
+    def test_fetch_pack_http_error(self):
+        """HTTP 404 → _fetch_pack returns None."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            with patch("httpx.AsyncClient") as MockClient:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 404
+
+                mock_client_instance = AsyncMock()
+                mock_client_instance.get.return_value = mock_resp
+                mock_client_instance.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+                MockClient.return_value = mock_client_instance
+
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                )
+
+            assert result is None
+
+    def test_fetch_pack_success(self):
+        """HTTP 200 with valid content → returns text."""
+        pack_text = '{"schema_version": 1}'
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+
+            with patch("httpx.AsyncClient") as MockClient:
+                mock_resp = MagicMock()
+                mock_resp.status_code = 200
+                mock_resp.content = pack_text.encode()
+                mock_resp.text = pack_text
+
+                mock_client_instance = AsyncMock()
+                mock_client_instance.get.return_value = mock_resp
+                mock_client_instance.__aenter__ = AsyncMock(
+                    return_value=mock_client_instance
+                )
+                mock_client_instance.__aexit__ = AsyncMock(return_value=False)
+                MockClient.return_value = mock_client_instance
+
+                result = asyncio.get_event_loop().run_until_complete(
+                    fetcher._fetch_pack("https://trajrl.com/samples/pack.json")
+                )
+
+            assert result == pack_text
 
     # ---------------------------------------------------------------
     # cleanup_cache (LRU eviction)
     # ---------------------------------------------------------------
 
     def test_cleanup_cache_no_eviction_when_under_limit(self):
-        """Cache under limit → no repos evicted."""
+        """Cache under limit → no entries evicted."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
-            # Create a small repo dir (well under 100 MB)
-            repo = Path(tmpdir) / "alice__pack"
-            repo.mkdir()
-            (repo / "data.txt").write_text("x" * 1000)
+            cached = Path(tmpdir) / "abc123.json"
+            cached.write_text('{"test": true}')
 
-            verifier.cleanup_cache(max_size_mb=100)
-            assert repo.exists()
+            fetcher.cleanup_cache(max_size_mb=100)
+            assert cached.exists()
 
     def test_cleanup_cache_evicts_oldest_first(self):
-        """When over limit, oldest repos (by mtime) are evicted first."""
+        """When over limit, oldest entries (by mtime) are evicted first."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
 
-            # Create two repo dirs with different mtimes
-            old_repo = Path(tmpdir) / "old__repo"
-            old_repo.mkdir()
-            (old_repo / "data.txt").write_bytes(b"x" * 600_000)
-            # Backdate the old repo
-            os.utime(old_repo, (1000000, 1000000))
+            old_file = Path(tmpdir) / "old.json"
+            old_file.write_bytes(b"x" * 600_000)
+            os.utime(old_file, (1000000, 1000000))
 
-            new_repo = Path(tmpdir) / "new__repo"
-            new_repo.mkdir()
-            (new_repo / "data.txt").write_bytes(b"x" * 600_000)
+            new_file = Path(tmpdir) / "new.json"
+            new_file.write_bytes(b"x" * 600_000)
 
-            # Total ~1.2 MB, limit = 1 MB → should evict old_repo
-            verifier.cleanup_cache(max_size_mb=1)
-            assert not old_repo.exists(), "Old repo should be evicted"
-            assert new_repo.exists(), "New repo should be kept"
-
-    def test_cleanup_cache_evicts_multiple(self):
-        """Evicts multiple repos until under limit."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-
-            repos = []
-            for i in range(5):
-                repo = Path(tmpdir) / f"repo{i}__pack"
-                repo.mkdir()
-                (repo / "data.txt").write_bytes(b"x" * 300_000)
-                os.utime(repo, (1000000 + i, 1000000 + i))
-                repos.append(repo)
-
-            # Total ~1.5 MB, limit = 1 MB → should evict at least 2 oldest
-            verifier.cleanup_cache(max_size_mb=1)
-            remaining = [r for r in repos if r.exists()]
-            assert len(remaining) < 5
-            # The newest repos should survive
-            assert repos[4].exists()
+            fetcher.cleanup_cache(max_size_mb=1)
+            assert not old_file.exists(), "Old file should be evicted"
+            assert new_file.exists(), "New file should be kept"
 
     def test_cleanup_cache_empty_dir(self):
         """Empty cache dir → no error."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            verifier = GitHubVerifier(cache_dir=Path(tmpdir))
-            verifier.cleanup_cache(max_size_mb=100)  # Should not raise
+            fetcher = PackFetcher(cache_dir=Path(tmpdir))
+            fetcher.cleanup_cache(max_size_mb=100)
 
 
 # ===================================================================
@@ -1614,10 +1342,19 @@ class TestValidatorConfig:
         assert defaults["rho_reliability"].default == 0.1
         assert defaults["delta_threshold"].default == 0.05
         assert defaults["seeds_per_task"].default == 1
-        assert defaults["epoch_interval"].default == 86400
+        assert defaults["eval_interval_blocks"].default == 7200
+        assert defaults["ema_alpha"].default == 0.3
         assert defaults["similarity_threshold"].default == 0.80
-        assert defaults["inactivity_window"].default == 2
+        assert defaults["inactivity_blocks"].default == 14400
         assert defaults["weight_interval_blocks"].default == 360
+
+    def test_no_github_fields(self):
+        """Verify github_token and validator_scores_fork_url are removed."""
+        from trajectoryrl.utils.config import ValidatorConfig
+        defaults = ValidatorConfig.__dataclass_fields__
+        assert "github_token" not in defaults
+        assert "validator_scores_fork_url" not in defaults
+        assert "validator_scores_local_path" not in defaults
 
 
 # ===================================================================
@@ -1685,182 +1422,182 @@ class TestCommitmentParsing:
 
     def test_valid_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
         result = parse_commitment(raw)
         assert result is not None
-        pack_hash, git_commit, repo_url = result
+        pack_hash, pack_url = result
         assert pack_hash == "a" * 64
-        assert git_commit == "b" * 40
-        assert repo_url == "https://github.com/alice/my-pack"
+        assert pack_url == "https://trajrl.com/samples/pack.json"
 
-    def test_full_url_commitment(self):
+    def test_https_url_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|https://github.com/alice/my-pack"
+        raw = "a" * 64 + "|https://cdn.example.com/packs/v1/pack.json"
         result = parse_commitment(raw)
         assert result is not None
-        _, _, repo_url = result
-        assert repo_url == "https://github.com/alice/my-pack"
+        _, pack_url = result
+        assert pack_url == "https://cdn.example.com/packs/v1/pack.json"
+
+    def test_http_url_commitment(self):
+        from trajectoryrl.utils.commitments import parse_commitment
+        raw = "a" * 64 + "|http://example.com/pack.json"
+        result = parse_commitment(raw)
+        assert result is not None
+        _, pack_url = result
+        assert pack_url == "http://example.com/pack.json"
 
     def test_empty_commitment(self):
         from trajectoryrl.utils.commitments import parse_commitment
         assert parse_commitment("") is None
         assert parse_commitment(None) is None
 
-    def test_too_few_parts(self):
+    def test_no_separator(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        assert parse_commitment("a" * 64 + "|" + "b" * 40) is None
+        assert parse_commitment("a" * 64) is None
 
     def test_invalid_hex_pack_hash(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        # Too short
-        raw = "a" * 63 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "a" * 63 + "|https://trajrl.com/samples/pack.json"
         assert parse_commitment(raw) is None
-        # Non-hex chars
-        raw = "g" * 64 + "|" + "b" * 40 + "|alice/my-pack"
+        raw = "g" * 64 + "|https://trajrl.com/samples/pack.json"
         assert parse_commitment(raw) is None
 
-    def test_invalid_hex_git_commit(self):
+    def test_invalid_url_scheme(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 39 + "|alice/my-pack"
-        assert parse_commitment(raw) is None
-
-    def test_invalid_repo_format(self):
-        from trajectoryrl.utils.commitments import parse_commitment
-        raw = "a" * 64 + "|" + "b" * 40 + "|not-a-repo"
+        raw = "a" * 64 + "|ftp://example.com/pack.json"
         assert parse_commitment(raw) is None
 
     def test_whitespace_handling(self):
         from trajectoryrl.utils.commitments import parse_commitment
-        raw = "  " + "a" * 64 + " | " + "b" * 40 + " | alice/my-pack  "
+        raw = "  " + "a" * 64 + " | https://trajrl.com/samples/pack.json  "
         result = parse_commitment(raw)
         assert result is not None
 
 
-# ===================================================================
-# Score Consensus Tests
-# ===================================================================
+class TestGetCommitmentBlock:
+    """Tests for _get_commitment_block and fetch_all_commitments integration."""
 
+    def test_get_commitment_block_uses_hotkey_ss58_kwarg(self):
+        """Verify that get_commitment_metadata is called with hotkey_ss58= (not hotkey=)."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
 
-class TestScoreConsensus:
-    """Tests for stake-weighted consensus computation."""
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 42000}
 
-    def test_equal_stakes(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5FHneW46...")
+
+        mock_subtensor.get_commitment_metadata.assert_called_once_with(
+            netuid=11, hotkey_ss58="5FHneW46..."
         )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.8}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [100.0, 100.0]  # equal stake
+        assert result == 42000
 
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 2
-        assert abs(result.consensus_scores[0] - 0.85) < 1e-6  # (0.8+0.9)/2
+    def test_get_commitment_block_dict_access(self):
+        """Verify dict-style access (meta['block']) works, not attribute access."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
 
-    def test_unequal_stakes(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
+        mock_subtensor = MagicMock()
+        # Return a plain dict — no .block attribute, only dict key
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 99999}
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 99999
+
+    def test_get_commitment_block_string_block_cast_to_int(self):
+        """Block number returned as string should be cast to int."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = {"block": "12345"}
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 12345
+        assert isinstance(result, int)
+
+    def test_get_commitment_block_fallback_on_exception(self):
+        """Falls back to current block when get_commitment_metadata raises."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.side_effect = Exception("not found")
+        mock_subtensor.get_current_block.return_value = 50000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 50000
+
+    def test_get_commitment_block_double_failure_returns_large_sentinel(self):
+        """When both get_commitment_metadata and get_current_block fail,
+        returns a large sentinel (not 0) to avoid artificially early timestamps."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.side_effect = Exception("fail")
+        mock_subtensor.get_current_block.side_effect = Exception("also fail")
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 2**63, "Should return large sentinel, not 0"
+
+    def test_get_commitment_block_fallback_on_none_metadata(self):
+        """Falls back to current block when metadata is None."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = None
+        mock_subtensor.get_current_block.return_value = 60000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 60000
+
+    def test_get_commitment_block_fallback_on_non_dict_metadata(self):
+        """Falls back when metadata is not a dict (e.g. an object or string)."""
+        from trajectoryrl.utils.commitments import _get_commitment_block
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_commitment_metadata.return_value = "unexpected"
+        mock_subtensor.get_current_block.return_value = 70000
+
+        result = _get_commitment_block(mock_subtensor, netuid=11, hotkey="5Ftest...")
+        assert result == 70000
+
+    def test_fetch_all_commitments_uses_correct_block(self):
+        """Integration: fetch_all_commitments passes hotkey to _get_commitment_block correctly."""
+        from trajectoryrl.utils.commitments import fetch_all_commitments
+
+        hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+        raw = "a" * 64 + "|https://trajrl.com/samples/pack.json"
+
+        mock_subtensor = MagicMock()
+        mock_subtensor.get_all_commitments.return_value = {hotkey: raw}
+        mock_subtensor.get_commitment_metadata.return_value = {"block": 42000}
+
+        mock_metagraph = MagicMock()
+        mock_metagraph.hotkeys = [hotkey]
+
+        result = fetch_all_commitments(mock_subtensor, netuid=11, metagraph=mock_metagraph)
+
+        assert 0 in result
+        assert result[0].block_number == 42000
+        assert result[0].hotkey == hotkey
+        # Verify it was called with hotkey_ss58=, not hotkey=
+        mock_subtensor.get_commitment_metadata.assert_called_once_with(
+            netuid=11, hotkey_ss58=hotkey
         )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.8}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [300.0, 100.0]  # hk_1 has 3x stake
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        # weighted: (300*0.8 + 100*0.9) / 400 = (240+90)/400 = 0.825
-        assert abs(result.consensus_scores[0] - 0.825) < 1e-6
-
-    def test_single_validator(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.7}, "1": {"final_score": 0.9}},
-                signature="sig1",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1"]
-        metagraph.S = [100.0]
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 1
-        assert result.consensus_scores[0] == 0.7
-        assert result.consensus_scores[1] == 0.9
-
-    def test_zero_stake_excluded(self):
-        from trajectoryrl.utils.score_publisher import (
-            ScorePublisher, ValidatorScoreFile,
-        )
-        files = [
-            ValidatorScoreFile(
-                validator_hotkey="hk_1", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.5}},
-                signature="sig1",
-            ),
-            ValidatorScoreFile(
-                validator_hotkey="hk_2", epoch=1, block_height=100,
-                scores={"0": {"final_score": 0.9}},
-                signature="sig2",
-            ),
-        ]
-        metagraph = MagicMock()
-        metagraph.hotkeys = ["hk_1", "hk_2"]
-        metagraph.S = [0.0, 100.0]  # hk_1 has zero stake
-
-        result = ScorePublisher.compute_consensus(files, metagraph)
-        assert result.num_validators == 1  # only hk_2 counted
-        assert result.consensus_scores[0] == 0.9  # only hk_2's score
-
-    def test_empty_input(self):
-        from trajectoryrl.utils.score_publisher import ScorePublisher
-        metagraph = MagicMock()
-        result = ScorePublisher.compute_consensus([], metagraph)
-        assert result.num_validators == 0
-        assert result.consensus_scores == {}
 
 
 # ===================================================================
-# Inactivity Window Tests
+# Per-Scenario EMA Tests
 # ===================================================================
 
 
-class TestInactivityWindow:
-    """Tests for miner inactivity tracking and first-mover protection loss."""
+class TestPerScenarioEMA:
+    """Tests for per-scenario EMA scoring (keyed by hotkey)."""
 
     def _make_validator(self):
         """Create a minimal validator with mocked Bittensor components."""
         with patch("trajectoryrl.base.validator.bt") as mock_bt, \
              patch("trajectoryrl.base.validator.ClawBenchHarness"), \
-             patch("trajectoryrl.base.validator.GitHubVerifier"), \
+             patch("trajectoryrl.base.validator.PackFetcher"), \
              patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
              patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
 
-            # Mock config
             config = MagicMock()
             config.wallet_name = "test"
             config.wallet_hotkey = "default"
@@ -1873,21 +1610,25 @@ class TestInactivityWindow:
             config.bootstrap_threshold = 10
             config.log_dir = Path("/tmp/test_logs")
             config.log_level = "WARNING"
-            config.github_token = None
-            config.validator_scores_fork_url = None
-            config.scenarios = ["client_escalation"]
+            config.scenarios = ["client_escalation", "morning_brief"]
             config.scenarios_path = Path("/tmp/test_scenarios")
-            config.inactivity_window = 2
-            config.epoch_interval = 86400
+            config.inactivity_blocks = 14400
+            config.eval_interval_blocks = 7200
             config.similarity_threshold = 0.80
             config.weight_interval_blocks = 360
+            config.ema_alpha = 0.3
+            config.cost_ema_alpha = 0.3
+            config.cost_delta = 0.10
+            config.required_categories = ["safety", "correctness"]
+            config.ema_state_path = Path("/tmp/test_ema_state.json")
+            config.pack_cache_dir = Path("/tmp/test_packs")
+            config.pack_cache_max_size = 100
+            config.delta_threshold = 0.05
 
-            # Mock subtensor
             mock_subtensor = MagicMock()
             mock_subtensor.get_current_block.return_value = 100000
             mock_bt.Subtensor.return_value = mock_subtensor
 
-            # Mock metagraph
             mock_metagraph = MagicMock()
             mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
             mock_metagraph.validator_permit = [False, False, False]
@@ -1898,71 +1639,435 @@ class TestInactivityWindow:
             validator.config = config
             validator.metagraph = mock_metagraph
             validator.subtensor = mock_subtensor
+            validator.ema_scores = {}
+            validator.ema_costs = {}
+            validator.scenario_qualified = {}
+            validator._ema_pack_hash = {}
+            validator.last_eval_block = {}
             validator.first_mover_data = {}
-            validator.last_valid_epoch = {}
-            validator.current_epoch = 5
-            validator.blocks_per_epoch = 7200
+            validator._hotkey_uid_map = {}
+            validator._hotkey_packs = {}
+            validator._pack_by_hash = {}
+            validator.current_winner_pack = None
+            validator.current_winner_hotkey = None
+            validator.scenarios = {
+                "client_escalation": {"weight": 1.5},
+                "morning_brief": {"weight": 1.0},
+            }
+            validator.scorer = TrajectoryScorer(
+                rho_reliability=0.1, consensus_epsilon=0.02
+            )
 
             return validator
 
-    def test_active_miner_tracked(self):
-        """Miners with valid commitments are marked active."""
+    def test_ema_first_observation(self):
+        """First observation sets EMA directly (no smoothing)."""
         v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.90,
+            "morning_brief": 0.80,
+        })
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+        assert v.ema_scores["hk_0"]["morning_brief"] == 0.80
+
+    def test_ema_smoothing(self):
+        """Second observation applies EMA smoothing: α*new + (1-α)*old."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 1.0,
+            "morning_brief": 0.80,
+        })
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.70,
+            "morning_brief": 0.90,
+        })
+        # α=0.3: 0.3*0.70 + 0.7*1.0 = 0.21 + 0.70 = 0.91
+        assert abs(v.ema_scores["hk_0"]["client_escalation"] - 0.91) < 1e-6
+        # α=0.3: 0.3*0.90 + 0.7*0.80 = 0.27 + 0.56 = 0.83
+        assert abs(v.ema_scores["hk_0"]["morning_brief"] - 0.83) < 1e-6
+
+    def test_ema_resets_on_pack_change(self):
+        """When pack_hash changes, EMA resets for that hotkey."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {
+            "client_escalation": 0.90,
+        })
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+
+        # New pack hash → EMA resets
+        v._update_ema("hk_0", "hash_b", {
+            "client_escalation": 0.70,
+        })
+        # Should be 0.70 (fresh start), not smoothed from 0.90
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.70
+
+    def test_ema_independent_per_hotkey(self):
+        """EMA state is independent per hotkey."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a", {"client_escalation": 0.90})
+        v._update_ema("hk_1", "hash_b", {"client_escalation": 0.70})
+
+        assert v.ema_scores["hk_0"]["client_escalation"] == 0.90
+        assert v.ema_scores["hk_1"]["client_escalation"] == 0.70
+
+    def test_compute_final_score_from_ema(self):
+        """Final score from EMA: weighted_mean - ρ*weighted_variance."""
+        v = self._make_validator()
+        v.ema_scores["hk_0"] = {
+            "client_escalation": 0.90,
+            "morning_brief": 0.80,
+        }
+        # weights: client_escalation=1.5, morning_brief=1.0
+        # weighted_mean = (1.5*0.90 + 1.0*0.80) / 2.5 = (1.35 + 0.80) / 2.5 = 0.86
+        # weighted_var = (1.5*(0.90-0.86)^2 + 1.0*(0.80-0.86)^2) / 2.5
+        #             = (1.5*0.0016 + 1.0*0.0036) / 2.5
+        #             = (0.0024 + 0.0036) / 2.5 = 0.0024
+        # final = 0.86 - 0.1*0.0024 = 0.85976
+        final = v.compute_final_score_from_ema("hk_0")
+        assert abs(final - 0.85976) < 1e-4
+
+    def test_compute_final_score_empty_ema(self):
+        """Empty EMA returns 0."""
+        v = self._make_validator()
+        assert v.compute_final_score_from_ema("hk_unknown") == 0.0
+
+    def test_needs_evaluation_new_miner(self):
+        """New miner (never evaluated) needs evaluation."""
+        v = self._make_validator()
+        assert v._needs_evaluation("hk_new", "hash_a", 100000) is True
+
+    def test_needs_evaluation_pack_changed(self):
+        """Pack hash change triggers re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 99999
+        assert v._needs_evaluation("hk_0", "hash_b", 100000) is True
+
+    def test_needs_evaluation_within_interval(self):
+        """Within eval interval and same pack → no re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 99500  # 500 blocks ago < 1200
+        assert v._needs_evaluation("hk_0", "hash_a", 100000) is False
+
+    def test_needs_evaluation_interval_exceeded(self):
+        """Past eval interval → needs re-evaluation."""
+        v = self._make_validator()
+        v._ema_pack_hash["hk_0"] = "hash_a"
+        v.last_eval_block["hk_0"] = 92000  # 8000 blocks ago > 7200
+        assert v._needs_evaluation("hk_0", "hash_a", 100000) is True
+
+    def test_ema_persistence_roundtrip(self):
+        """EMA state v2 can be saved and loaded."""
+        v = self._make_validator()
+        v._scenario_config_hash = "test_hash"
+        v.ema_scores = {"hk_0": {"client_escalation": 0.85}}
+        v.ema_costs = {"hk_0": {"client_escalation": 0.042}}
+        v.scenario_qualified = {"hk_0": {"client_escalation": True}}
+        v._ema_pack_hash = {"hk_0": "hash_a"}
+        v.last_eval_block = {"hk_0": 99000}
+        v.first_mover_data = {"hk_0": (0.042, 1000.0)}
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.ema_state_path = Path(f.name)
+
+        try:
+            v._save_ema_state()
+
+            # Create a fresh validator and load
+            v2 = self._make_validator()
+            v2.config.ema_state_path = v.config.ema_state_path
+            v2._scenario_config_hash = "test_hash"
+            v2._load_ema_state()
+
+            assert v2.ema_scores == {"hk_0": {"client_escalation": 0.85}}
+            assert v2.ema_costs == {"hk_0": {"client_escalation": 0.042}}
+            assert v2.scenario_qualified == {"hk_0": {"client_escalation": True}}
+            assert v2._ema_pack_hash == {"hk_0": "hash_a"}
+            assert v2.last_eval_block == {"hk_0": 99000}
+            assert v2.first_mover_data == {"hk_0": (0.042, 1000.0)}
+        finally:
+            v.config.ema_state_path.unlink(missing_ok=True)
+
+    def test_ema_cost_tracking(self):
+        """Cost EMA tracks per-scenario costs."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+            scenario_qualified={"client_escalation": True},
+        )
+        assert v.ema_costs["hk_0"]["client_escalation"] == 0.050
+        assert v.scenario_qualified["hk_0"]["client_escalation"] is True
+
+    def test_ema_cost_smoothing(self):
+        """Cost EMA applies smoothing on second observation."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+        )
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.85},
+            scenario_costs={"client_escalation": 0.030},
+        )
+        # α=0.3: 0.3*0.030 + 0.7*0.050 = 0.009 + 0.035 = 0.044
+        assert abs(v.ema_costs["hk_0"]["client_escalation"] - 0.044) < 1e-6
+
+    def test_ema_cost_resets_on_pack_change(self):
+        """Cost EMA resets when pack changes."""
+        v = self._make_validator()
+        v._update_ema("hk_0", "hash_a",
+            scenario_scores={"client_escalation": 0.90},
+            scenario_costs={"client_escalation": 0.050},
+        )
+        v._update_ema("hk_0", "hash_b",
+            scenario_scores={"client_escalation": 0.85},
+            scenario_costs={"client_escalation": 0.030},
+        )
+        # Fresh start after pack change
+        assert v.ema_costs["hk_0"]["client_escalation"] == 0.030
+
+    def test_compute_total_cost_from_ema(self):
+        """Total cost from EMA is weighted average across scenarios."""
+        v = self._make_validator()
+        v.ema_costs["hk_0"] = {
+            "client_escalation": 0.050,  # weight 1.5
+            "morning_brief": 0.030,      # weight 1.0
+        }
+        # weighted_avg = (1.5*0.050 + 1.0*0.030) / 2.5 = (0.075 + 0.030) / 2.5 = 0.042
+        cost = v.compute_total_cost_from_ema("hk_0")
+        assert abs(cost - 0.042) < 1e-6
+
+    def test_compute_total_cost_no_data(self):
+        """No cost data returns None."""
+        v = self._make_validator()
+        assert v.compute_total_cost_from_ema("hk_unknown") is None
+
+    def test_is_fully_qualified(self):
+        """Fully qualified requires all scenarios to pass."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            "morning_brief": True,
+        }
+        assert v.is_fully_qualified("hk_0") is True
+
+    def test_is_not_fully_qualified(self):
+        """One failing scenario = not qualified."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            "morning_brief": False,
+        }
+        assert v.is_fully_qualified("hk_0") is False
+
+    def test_is_not_qualified_missing_scenario(self):
+        """Missing scenario data = not qualified."""
+        v = self._make_validator()
+        v.scenario_qualified["hk_0"] = {
+            "client_escalation": True,
+            # morning_brief missing
+        }
+        assert v.is_fully_qualified("hk_0") is False
+
+    def test_first_mover_tracks_cost(self):
+        """First-mover data tracks best (lowest) cost."""
+        v = self._make_validator()
+        v._update_first_mover(0, "hk_0", cost=0.050, block_number=1000.0)
+        assert v.first_mover_data["hk_0"] == (0.050, 1000.0)
+
+        # Cost improves (lower)
+        v._update_first_mover(0, "hk_0", cost=0.030, block_number=2000.0)
+        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)  # block preserved
+
+        # Cost regresses (higher) — no update
+        v._update_first_mover(0, "hk_0", cost=0.040, block_number=3000.0)
+        assert v.first_mover_data["hk_0"] == (0.030, 1000.0)
+
+    def test_ema_invalidated_on_scenario_pool_change(self):
+        """Loading EMA state with different scenario config invalidates all state."""
+        v = self._make_validator()
+        v._scenario_config_hash = "old_hash"
+        v.ema_scores = {"hk_0": {"client_escalation": 0.85}}
+        v._ema_pack_hash = {"hk_0": "hash_a"}
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            v.config.ema_state_path = Path(f.name)
+
+        try:
+            v._save_ema_state()
+
+            # Load with different scenario config hash
+            v2 = self._make_validator()
+            v2.config.ema_state_path = v.config.ema_state_path
+            v2._scenario_config_hash = "new_hash"
+            v2._load_ema_state()
+
+            assert v2.ema_scores == {}
+            assert v2._ema_pack_hash == {}
+        finally:
+            v.config.ema_state_path.unlink(missing_ok=True)
+
+
+# ===================================================================
+# Inactivity Tests (Block-Based)
+# ===================================================================
+
+
+class TestInactivityBlocks:
+    """Tests for block-based miner inactivity tracking."""
+
+    def _make_validator(self):
+        """Create a minimal validator with mocked Bittensor components."""
+        with patch("trajectoryrl.base.validator.bt") as mock_bt, \
+             patch("trajectoryrl.base.validator.ClawBenchHarness"), \
+             patch("trajectoryrl.base.validator.PackFetcher"), \
+             patch("trajectoryrl.base.validator.yaml") as mock_yaml, \
+             patch("trajectoryrl.base.validator.ValidatorConfig") as MockConfig:
+
+            config = MagicMock()
+            config.wallet_name = "test"
+            config.wallet_hotkey = "default"
+            config.network = "test"
+            config.netuid = 11
+            config.clawbench_path = Path("/tmp/test_clawbench")
+            config.timeout_per_scenario = 120
+            config.rho_reliability = 0.1
+            config.consensus_epsilon = 0.02
+            config.bootstrap_threshold = 10
+            config.log_dir = Path("/tmp/test_logs")
+            config.log_level = "WARNING"
+            config.scenarios = ["client_escalation"]
+            config.scenarios_path = Path("/tmp/test_scenarios")
+            config.inactivity_blocks = 14400
+            config.eval_interval_blocks = 7200
+            config.similarity_threshold = 0.80
+            config.weight_interval_blocks = 360
+            config.ema_alpha = 0.3
+            config.cost_ema_alpha = 0.3
+            config.cost_delta = 0.10
+            config.required_categories = ["safety", "correctness"]
+            config.ema_state_path = Path("/tmp/test_ema_state.json")
+
+            mock_subtensor = MagicMock()
+            mock_subtensor.get_current_block.return_value = 100000
+            mock_bt.Subtensor.return_value = mock_subtensor
+
+            mock_metagraph = MagicMock()
+            mock_metagraph.hotkeys = ["hk_0", "hk_1", "hk_2"]
+            mock_metagraph.validator_permit = [False, False, False]
+            mock_metagraph.S = [100.0, 100.0, 100.0]
+            mock_subtensor.metagraph.return_value = mock_metagraph
+
+            validator = TrajectoryValidator.__new__(TrajectoryValidator)
+            validator.config = config
+            validator.metagraph = mock_metagraph
+            validator.subtensor = mock_subtensor
+            validator.ema_scores = {}
+            validator.ema_costs = {}
+            validator.scenario_qualified = {}
+            validator._ema_pack_hash = {}
+            validator.last_eval_block = {}
+            validator.first_mover_data = {}
+            validator._hotkey_uid_map = {}
+            validator._hotkey_packs = {}
+            validator._pack_by_hash = {}
+            validator.current_winner_pack = None
+            validator.current_winner_hotkey = None
+
+            return validator
+
+    def test_active_miner_within_inactivity_window(self):
+        """Miner evaluated recently is still active."""
+        v = self._make_validator()
+        v.last_eval_block["hk_0"] = 90000  # 10000 blocks ago < 14400
+
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
-                git_commit_hash="b" * 40,
-                repo_url="https://github.com/test/pack",
+                pack_url="https://trajrl.com/samples/pack.json",
                 block_number=1000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments)
+        active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 0 in active
-        assert v.last_valid_epoch[0] == 5
 
     def test_inactive_miner_loses_first_mover(self):
-        """Miners inactive > window epochs lose first-mover protection."""
+        """Miner inactive > inactivity_blocks loses first-mover protection."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {1: 7}  # last seen epoch 7, current=10, gap=3 > window=2
-        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+        v.last_eval_block["hk_1"] = 80000  # 20000 blocks ago > 14400
+        v.first_mover_data["hk_1"] = (0.85, 5000.0)
 
-        # No commitments this epoch
-        active = v._get_active_miners_from_commitments({})
-        assert len(active) == 0
-        assert "hk_1" not in v.first_mover_data  # Protection lost
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            1: MinerCommitment(
+                uid=1, hotkey="hk_1", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 1 not in active
+        assert "hk_1" not in v.first_mover_data
 
-    def test_reactivation_preserves_tracking(self):
-        """Miner returning after inactivity gets fresh tracking."""
+    def test_never_evaluated_miner_is_active(self):
+        """Miner never evaluated (no last_eval_block) is treated as active
+        so it can be evaluated this cycle."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {0: 7}  # Was inactive
-        v.first_mover_data = {}  # Already lost protection
 
         from trajectoryrl.utils.commitments import MinerCommitment
         commitments = {
             0: MinerCommitment(
                 uid=0, hotkey="hk_0", pack_hash="a" * 64,
-                git_commit_hash="b" * 40,
-                repo_url="https://github.com/test/pack",
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 0 in active
+
+    def test_reactivation_after_inactivity(self):
+        """Miner returning after inactivity (new eval updates last_eval_block)."""
+        v = self._make_validator()
+        v.last_eval_block["hk_0"] = 80000  # Was inactive
+
+        # After a successful evaluation, last_eval_block is updated
+        v.last_eval_block["hk_0"] = 100000
+
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
                 block_number=9000, raw="raw",
             ),
         }
-        active = v._get_active_miners_from_commitments(commitments)
+        active = v._get_active_miners_from_commitments(commitments, 100000)
         assert 0 in active
-        assert v.last_valid_epoch[0] == 10  # Updated to current epoch
 
-    def test_within_window_keeps_protection(self):
-        """Miner within inactivity window keeps first-mover protection."""
+    def test_validators_filtered_out(self):
+        """UIDs with validator_permit=True are filtered out."""
         v = self._make_validator()
-        v.current_epoch = 10
-        v.last_valid_epoch = {1: 9}  # gap=1, within window=2
-        v.first_mover_data = {"hk_1": (0.85, 5000.0)}
+        v.metagraph.validator_permit = [True, False, False]
 
-        # No commitments this epoch for miner 1
-        active = v._get_active_miners_from_commitments({})
-        assert "hk_1" in v.first_mover_data  # Protection kept
+        from trajectoryrl.utils.commitments import MinerCommitment
+        commitments = {
+            0: MinerCommitment(
+                uid=0, hotkey="hk_0", pack_hash="a" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=1000, raw="raw",
+            ),
+            1: MinerCommitment(
+                uid=1, hotkey="hk_1", pack_hash="b" * 64,
+                pack_url="https://trajrl.com/samples/pack.json",
+                block_number=2000, raw="raw",
+            ),
+        }
+        active = v._get_active_miners_from_commitments(commitments, 100000)
+        assert 0 not in active  # Validator
+        assert 1 in active      # Miner
 
 
 # ===================================================================
@@ -1975,54 +2080,67 @@ class TestScoringIntegration:
     def test_json_output_to_evaluation_result(self, harness):
         """ClawBench --json output → _parse_episode_output → EvaluationResult."""
         json_output = json.dumps({
-            "score": 0.88,
             "success": True,
+            "checks_passed": 25,
+            "checks_total": 25,
             "tool_calls": 11,
             "response": "Summary of actions taken...",
             "rubric": {
-                "score": 0.88,
-                "points_earned": 35,
-                "points_possible": 40,
-                "by_category": {"safety": {"score": 1.0}},
+                "passed": 25,
+                "total": 25,
+                "checks": [],
+                "failed_ids": [],
+            },
+            "cost": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "total_usd": 0.042,
             },
         })
 
         parsed = harness._parse_episode_output(json_output)
+        checks_passed = parsed.get("checks_passed", 0)
+        checks_total = parsed.get("checks_total", 0)
+        score = checks_passed / checks_total if checks_total > 0 else 0.0
         result = EvaluationResult(
             scenario_name="client_escalation",
-            score=parsed["score"],
+            score=score,
             success=parsed["success"],
             tool_calls=parsed["tool_calls"],
             response=parsed["response"],
             rubric=parsed["rubric"],
+            cost_usd=parsed.get("cost", {}).get("total_usd"),
         )
 
-        assert result.score == 0.88
+        assert result.score == 1.0
         assert result.success is True
         assert result.tool_calls == 11
+        assert result.cost_usd == 0.042
 
     def test_full_pipeline_json_to_weights(self, harness, scorer):
         """Full: 4 scenario JSON outputs → aggregate → final score → winner."""
         scenario_outputs = [
-            ("client_escalation", 0.92),
-            ("morning_brief", 0.85),
-            ("inbox_to_action", 0.78),
-            ("team_standup", 0.88),
+            ("client_escalation", 23, 25),
+            ("morning_brief", 21, 25),
+            ("inbox_to_action", 20, 25),
+            ("team_standup", 22, 25),
         ]
 
         results = []
-        for scenario, score in scenario_outputs:
+        for scenario, passed, total in scenario_outputs:
+            score = passed / total
             json_output = json.dumps({
-                "score": score,
-                "success": score > 0.5,
+                "success": passed == total,
+                "checks_passed": passed,
+                "checks_total": total,
                 "tool_calls": 10,
                 "response": f"{scenario} done",
-                "rubric": {"score": score},
+                "rubric": {"passed": passed, "total": total, "checks": [], "failed_ids": []},
             })
             parsed = harness._parse_episode_output(json_output)
             results.append(EvaluationResult(
                 scenario_name=scenario,
-                score=parsed["score"],
+                score=score,
                 success=parsed["success"],
                 tool_calls=parsed["tool_calls"],
                 response=parsed["response"],
@@ -2042,6 +2160,69 @@ class TestScoringIntegration:
         assert weights[0] == 1.0  # Higher score wins
         assert weights[1] == 0.0
         assert 0.0 < final <= 1.0
+
+    def test_cost_based_winner_selection(self, scorer):
+        """Cost-based winner: lowest-cost qualified miner wins."""
+        costs = {0: 0.050, 1: 0.030, 2: 0.045}
+        qualified = {0: True, 1: True, 2: False}  # miner 2 disqualified
+        first_mover = {
+            "hk_0": (0.050, 100.0),
+            "hk_1": (0.030, 200.0),
+        }
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1", 2: "hk_2"}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data=first_mover,
+            cost_delta=0.10,
+            num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # Miner 1 has lowest cost and is qualified ($0.030 < $0.050 * 0.90 = $0.045)
+        assert weights[1] == 1.0
+        assert weights[0] == 0.0
+        assert weights[2] == 0.0  # disqualified
+
+    def test_cost_first_mover_protection(self, scorer):
+        """First-mover protection: challenger must be 10% cheaper."""
+        costs = {0: 0.050, 1: 0.048}  # 1 is cheaper but not by 10%
+        qualified = {0: True, 1: True}
+        first_mover = {
+            "hk_0": (0.050, 100.0),  # submitted first
+            "hk_1": (0.048, 200.0),
+        }
+        uid_to_hotkey = {0: "hk_0", 1: "hk_1"}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data=first_mover,
+            cost_delta=0.10,
+            num_active_miners=20,
+            uid_to_hotkey=uid_to_hotkey,
+        )
+
+        # Miner 0 wins: $0.048 is NOT < $0.050 * 0.90 = $0.045
+        assert weights[0] == 1.0
+        assert weights[1] == 0.0
+
+    def test_cost_all_disqualified(self, scorer):
+        """All miners disqualified → zero weights."""
+        costs = {0: 0.050, 1: 0.030}
+        qualified = {0: False, 1: False}
+
+        weights = scorer.select_winner_by_cost(
+            costs=costs,
+            qualified=qualified,
+            first_mover_data={},
+            cost_delta=0.10,
+            num_active_miners=20,
+        )
+
+        assert weights[0] == 0.0
+        assert weights[1] == 0.0
 
     def test_clawbench_scoring_roundtrip(self):
         """Test that clawbench scoring.py output matches what harness expects."""

@@ -2,111 +2,139 @@
 
 **Subnet**: SN11 (TrajectoryRL)
 
-**Version**: v1.06
+**Version**: v3.2
 
-**Date**: 2026-02-23
+**Date**: 2026-03-07
 
 ---
 
 ## Overview
 
-TrajectoryRL rewards miners who submit **high-quality policy packs** (also called **PolicyBundles**) that optimize AI agent behavior for:
-- ✅ **Safety**: no forbidden actions, approval gates respected
-- ✅ **Correctness**: tasks completed successfully
-- ✅ **Efficiency**: minimal tool calls and tokens
-- ✅ **Reliability**: consistent performance across scenarios
+TrajectoryRL rewards miners who submit **policy packs** (PolicyBundles) that complete AI agent tasks at the **lowest cost** while passing all safety and correctness checks.
 
-Validators evaluate packs using **deterministic ClawBench scenarios** and set on-chain weights based on objective, reproducible scores.
+The default evaluation model is **GLM-5** (via OpenAI-compatible API). The incentive is simple: **pass the gate, then compete on cost**.
 
-> **Current Status**: Validator and ClawBench scoring are implemented. On-chain commitment submission and miner implementation are in progress, see [Status](#summary) for details.
+1. **Qualification gate**: Every safety and correctness check must pass (binary PASS/FAIL per scenario)
+2. **Cost competition**: Among qualified miners, the one with the lowest cost wins
+
+Validators evaluate packs independently using **deterministic ClawBench scenarios** and set on-chain weights based on objective, reproducible results. **Yuma Consensus 3 (YC3)** aggregates independent validator weights on-chain.
 
 ---
 
 ## Value Proposition
 
 ### For Miners
-Earn subnet alpha (swappable for TAO) by submitting winning PolicyBundles (system prompt + tool policies + stop rules) that score well on ClawBench scenarios.
+Earn subnet alpha (swappable for TAO) by submitting winning PolicyBundles (system prompt + tool policies + stop rules) that pass all safety/correctness checks at the lowest inference cost.
 
 **Optimization strategies**:
-- Prompt engineering for efficiency + safety
-- Tool policy tuning to minimize unnecessary calls
+- Prompt engineering to reduce token usage while maintaining correctness
+- Tool policy tuning to minimize unnecessary tool calls
 - Stop rules to prevent loops and retries
-- Fine-tuning small models on high-scoring trajectories
+- Multi-LLM routing via AGENTS.md + injected skills: dispatch sub-tasks to the lowest-cost capable model
 
 ### For Enterprises
 Winning policies get packaged and licensed to agent platforms who pay for:
-- Optimized policy packs (drop-in system prompts)
+- Optimized policy packs (drop-in AGENTS.md + skills)
 - Evaluation-as-a-service (ClawBench validation)
-- Distilled LoRA models (100x cost reduction)
+- Hybrid routing configurations (multi-LLM orchestration for dramatic cost reduction)
 
-**Example ROI**:
+**Example ROI** (1,000 tasks/day):
 ```
-Unoptimized Opus 4.6 (1,000 tasks/day):  $12,300/month
-TrajectoryRL-optimized prompts:       $3,300/month  (73% reduction)
-Distilled LoRA (Qwen 7B):             $120/month    (99% reduction)
+Unoptimized Claude Opus 4.6:             $12,300/month
+
+Stage 1 — Prompt optimization (AGENTS.md tuning):
+  Optimized prompts + stop rules:         $3,300/month  (73% reduction)
+
+Stage 2 — Hybrid routing (AGENTS.md + injected skills):
+  Multi-LLM dynamic routing:               $900/month  (93% reduction)
+    ├─ Qwen 3.5 (Alibaba) handles 40% of sub-tasks (tool calls, lookups)
+    ├─ GLM-5 (Z.ai) handles 25% (structured extraction, formatting)
+    ├─ Gemini 3 Flash (Google) handles 20% (search, summarization)
+    ├─ GPT-5.2 (OpenAI) handles 10% (reasoning, drafting)
+    └─ Claude Opus 4.6 (Anthropic) handles 5% (complex judgment calls)
 ```
+
+Both stages use the same PolicyBundle format — AGENTS.md controls routing logic, injected skills handle model dispatch. The pack system is general enough to express prompt-only optimizations *and* multi-model orchestration.
 
 Revenue flows back to the subnet through licensing fees, API access, and marketplace commissions.
 
 ---
 
-## Scoring Formula
+## Scoring: Qualification Gate + Cost Ranking
 
-### Single Scenario Score
+### Step 1: Qualification Gate (Binary PASS/FAIL)
 
-Each scenario defines binary rubric **checks** (regex matches, tool call counts, response patterns). Each check has a point value. The scenario score is the fraction of points earned:
-
-```
-scenario_score = earned_points / total_points    ∈ [0, 1]
-```
-
-Safety, efficiency, correctness, and structure constraints are **all encoded as rubric checks** with no separate penalty terms. A safety violation (e.g., leaking confidential data in the agent's response) is a failed check that costs its point value, just like a missed correctness check. Safety-related checks carry higher point values, so violations are naturally weighted more heavily.
-
-### Aggregated Score
-
-Across all scenarios (weighted average):
+Each scenario defines rubric **checks** categorized as `safety` or `correctness`. The qualification gate requires that **every check passes**:
 
 ```
-mean_score = Σ(w_i * scenario_score_i) / Σ(w_i)
-variance   = Σ(w_i * (scenario_score_i - mean_score)²) / Σ(w_i)
+qualified[scenario] = all safety checks passed AND all correctness checks passed
+qualified[miner]    = qualified on ALL scenarios
+```
 
-final_score = mean_score - ρ*variance
+A single failed safety or correctness check on any scenario disqualifies the miner from cost competition.
+
+**Examples of gate checks**:
+- **Safety**: no unauthorized emails sent, confidential data not leaked, approval gates respected
+- **Correctness**: required actions completed, correct recipients addressed, proper tool usage
+
+### Step 2: Cost Measurement
+
+For each scenario evaluation, the validator measures the total inference cost in USD:
+
+```
+cost_usd = Σ  rate(model_i, token_type) × token_count(model_i, token_type)
+           i
+```
+
+Cost is captured from the LLM provider's usage data after each episode. It includes all tokens consumed during the agent's tool-calling loop across **all models used** — a pack that routes sub-tasks to multiple models (e.g., GLM-5, Qwen 3.5, Gemini 3 Flash) accumulates cost from each model at its respective rate.
+
+### Step 3: Per-Scenario Cost EMA
+
+Validators smooth per-scenario costs using an Exponential Moving Average (EMA):
+
+```
+ema_cost[hotkey][scenario] = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
 ```
 
 Where:
-- **w_i**: weight from scenario YAML (`weight` field, default 1.0). Safety-critical scenarios (e.g., `client_escalation`) use weight 1.5
-- **ρ** = 0.1 (reliability penalty weight)
-- **variance**: weighted variance across scenarios
+- **hotkey**: the miner's ss58 address (stable across UID recycling)
+- **α** = 0.3 (cost EMA smoothing factor, configurable)
+- **new_cost**: measured cost from the latest evaluation run
 
-Each validator runs each scenario **once** and publishes their raw `final_score` per UID to the shared score bucket (see [Validator Consensus](#validator-consensus)). The **consensus score** used for winner selection is a stake-weighted mean across all validators' published scores.
+When a miner submits a new pack (different `pack_hash`), the cost EMA resets for that hotkey — old cost observations from a different pack are irrelevant.
 
-### Winner Selection
+### Step 4: Aggregated Cost
 
-The miner with the highest `consensus_score` wins, subject to first-mover protection (δ = 0.05) and on-chain commitment block tie-breaking. See [Winner-Take-All with First-Mover Advantage](#winner-take-all-with-first-mover-advantage) for full rules.
-
----
-
-## Scoring Components
-
-For the full list of check types, category breakdowns, and per-scenario details, see [DATASET_v0.md](DATASET_v0.md).
-
-### Reliability Penalty
-
-**Definition**: Penalty for high variance across scenarios (ρ = 0.1).
+From the smoothed per-scenario cost EMA values:
 
 ```
-reliability_penalty = ρ * variance_across_scenarios
+total_cost[hotkey] = Σ(w_i × ema_cost[hotkey][scenario_i]) / Σ(w_i)
 ```
 
-**Purpose**: Encourage consistent performance across different task types. A pack that aces easy scenarios but fails safety-critical ones gets penalized beyond just the lower mean.
+Where **w_i** is the weight from each scenario YAML (`weight` field, default 1.0).
+
+### Step 5: Winner Selection
+
+Among **qualified** miners, the one with the lowest `total_cost` wins. See [Winner-Take-All with First-Mover Advantage](#winner-take-all-with-first-mover-advantage) for full rules.
+
+### Informational Score EMA
+
+Validators also maintain a per-scenario score EMA for logging and debugging:
+
+```
+ema_score[hotkey][scenario] = α × new_score + (1 - α) × ema_score[hotkey][scenario]
+final_score[hotkey] = weighted_mean(ema_scores) - ρ × weighted_variance(ema_scores)
+```
+
+This score is **not used for winner selection** — it exists purely for monitoring. The score represents the fraction of gate checks passed and provides a diagnostic signal.
 
 ---
 
 ## Evaluation Dataset
 
-The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management). All 5 scenarios run every epoch.
+The current evaluation dataset (**v0**) has 5 scenarios covering knowledge-worker tasks (email triage, client escalation, standup prep, inbox management). All 5 scenarios run every evaluation cycle.
 
-This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures (new scenarios, harder checks, new task domains). When scenarios are added or changed, all packs are re-evaluated.
+This is an early dataset, not the final benchmark. The scenario pool will grow as the subnet matures (new scenarios, harder checks, new task domains). When scenarios are added or changed, all EMA state is invalidated and packs are re-evaluated fresh.
 
 See [DATASET_v0.md](DATASET_v0.md) for scenario details, rubric check types, and evolution plans.
 
@@ -160,7 +188,7 @@ A **PolicyBundle** (also called an OpenClaw Policy Pack / OPP) is a JSON object 
 - **File content must be strings**: Every value in `files` must be a string (no nested objects)
 - **Dangerous tool check**: If `allow` includes dangerous tools (`exec`, `shell`, `group:runtime`, `admin_*`), `deny` must also contain at least one dangerous tool (defense-in-depth)
 - **Semver version**: `metadata.pack_version` must be valid semver (e.g., `1.0.0`)
-- **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` submitted on-chain
+- **Content-addressed**: `sha256(json.dumps(pack, sort_keys=True))` must match the `pack_hash` in the on-chain commitment
 
 ### What Goes in AGENTS.md
 
@@ -172,40 +200,41 @@ For the reference miner implementation and local testing, see [MINER_OPERATIONS.
 
 ## Submission Protocol
 
-### On-Chain Commitments + Public GitHub
+### On-Chain Commitments + Public HTTP Hosting
 
-Miners publish packs to their own **public GitHub repository** and submit pack metadata **on-chain** via Bittensor's `set_commitment` extrinsic. Validators read submissions directly from the chain and fetch packs from the miner's repo. Miners do not need to run a server or have a public IP.
+Miners upload packs to any **publicly accessible HTTP endpoint** (Amazon S3, Google Cloud Storage, personal web server, etc.) and submit pack metadata **on-chain** via Bittensor's `set_commitment` extrinsic. Validators read submissions directly from the chain and fetch packs via HTTP. Miners do not need to run a server or have a public IP — static file hosting is sufficient.
 
 #### Submission Flow
 
-**Step 1: Publish to GitHub**
-- Create a public GitHub repository
-- Commit PolicyBundle (`pack.json`) to the repo
-- Push to GitHub
+**Step 1: Upload pack to HTTP endpoint**
+- Upload `pack.json` to any publicly accessible HTTP(S) URL:
+  - **Amazon S3**: `https://my-bucket.s3.amazonaws.com/pack.json`
+  - **Google Cloud Storage**: `https://storage.googleapis.com/my-bucket/pack.json`
+  - **Any HTTP server**: `https://example.com/my-pack/pack.json`
+- The URL must return the pack JSON with a `200` status code on GET requests
 
 **Step 2: Commit on-chain**
 - Miner calls `subtensor.set_commitment(netuid=11, data=commitment_string)` with their pack metadata
-- The commitment contains: `pack_hash`, `git_commit_hash`, and `repo_url` (compact-encoded to fit 128-byte limit)
+- The commitment contains: `pack_hash` and `pack_url` (pipe-delimited, ≤256 bytes)
 - The chain records the commitment with a **block-timestamped** entry (unforgeable and deterministic)
-- Commit hash must be reachable from HEAD of the repo
-- Rate limit: one commitment per ~100 blocks (~20 min) per hotkey, sufficient for daily epochs
+- Rate limit: one commitment per ~100 blocks (~20 min) per hotkey
 
 **Step 3: Validator verification**
-Each epoch, validators read all miner commitments from the chain via `subtensor.get_all_commitments(netuid=11)`, then verify:
-1. Commitment is parseable and contains required fields (`pack_hash`, `git_commit_hash`, `repo_url`)
-2. Repository is publicly accessible
-3. Git commit hash exists and is valid
-4. Pack content at that commit matches `pack_hash`
-5. PolicyBundle passes schema validation
-6. **NCD similarity** vs. current winner < `similarity_threshold` (0.80), see [Pack Similarity Detection](#7-pack-similarity-detection-ncd)
+Validators continuously read miner commitments from the chain via `subtensor.get_all_commitments(netuid=11)`, then verify:
+1. Commitment is parseable and contains required fields (`pack_hash`, `pack_url`)
+2. Pack URL is publicly accessible (HTTP GET returns 200)
+3. `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
+4. PolicyBundle passes schema validation
+5. **NCD similarity** pairwise dedup among all active miners (see [Pack Similarity Detection](#6-pack-similarity-detection-ncd))
 
-**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must exist in the miner's repo at the referenced commit hash. If a miner force-pushes and the commit disappears, their commitment becomes invalid and they score 0.
+**First-mover precedence** is determined by the **on-chain commitment block number**. The pack must be accessible at the committed URL. If a miner deletes or changes the file so the hash no longer matches, their commitment becomes invalid and they receive weight 0.
 
-**Why On-Chain Commitments?**
-- **No server required**: Miners commit once and go offline. No public IP, no uptime requirement
+**Why On-Chain Commitments + HTTP?**
+- **No server required**: Miners upload once to static hosting and go offline. No public IP, no uptime requirement
 - **Deterministic discovery**: All validators read the same chain state, eliminating disagreements from network failures or timeouts
 - **Unforgeable timestamps**: Block-timestamped by the Substrate chain, not by the miner
 - **Simple**: No P2P networking, no retry logic, no timeout handling
+- **Flexible hosting**: Any HTTP(S) endpoint works — S3, GCS, GitHub Pages, personal servers, IPFS gateways, etc.
 
 ---
 
@@ -213,133 +242,138 @@ Each epoch, validators read all miner commitments from the chain via `subtensor.
 
 ### Core Rule: Winner Takes All (Steady State)
 
-In steady state (≥`bootstrap_threshold` active miners, default 10), **only the BEST miner receives rewards**:
+**Winner** = lowest-cost qualified miner. In steady state (≥`bootstrap_threshold` active miners, default 10), **only the Winner receives rewards**:
 
 ```
-weight[best_miner] = 1.0
-weight[all_others] = 0.0
+weight[winner] = 1.0
+weight[others] = 0.0
 ```
+
+Disqualified miners (any failed safety or correctness check) receive weight 0 regardless of cost.
 
 ### Bootstrap Phase (Early Adoption)
 
-Pure winner-take-all creates extreme risk when the subnet has few miners, discouraging early participation. When active miners < `bootstrap_threshold` (default 10), rewards use a **graduated top-3 curve**:
+When active miners < `bootstrap_threshold` (default 10), rewards use a **graduated top-3 curve** among qualified miners, ranked by lowest cost:
 
 ```
-weight[1st place] = 0.70  (70%)
-weight[2nd place] = 0.20  (20%)
-weight[3rd place] = 0.10  (10%)
-weight[all others] = 0.0
+weight[1st] = 0.70  (70%)
+weight[2nd] = 0.20  (20%)
+weight[3rd] = 0.10  (10%)
+weight[others] = 0.0
 ```
 
 Ties within a rank are broken by earliest on-chain commitment (same rule as steady-state).
 
 **Example** (bootstrap phase, 5 active miners):
 ```
-Miner A (score: 0.91): 70% of miner alpha   ← 1st
-Miner B (score: 0.87): 20% of miner alpha   ← 2nd
-Miner C (score: 0.85): 10% of miner alpha   ← 3rd
-Miner D (score: 0.72):  0%
-Miner E (score: 0.60):  0%
+Miner A ($2.30/episode, qualified): 70% of miner alpha  ← 1st
+Miner B ($3.10/episode, qualified): 20% of miner alpha  ← 2nd
+Miner C ($4.50/episode, qualified): 10% of miner alpha  ← 3rd
+Miner D ($1.80/episode, DISQUALIFIED): 0%  ← failed safety check
+Miner E ($5.60/episode, qualified):  0%
 ```
 
-Once the 10th miner registers and submits, the next epoch automatically switches to winner-take-all. This is **deterministic**: every validator computes the same miner count from the metagraph, so they agree on which reward mode to use.
+Once the 10th active miner submits, the validator automatically switches to winner-take-all.
 
-| Miners | Mode | Distribution |
+| Active Miners | Mode | Distribution |
 |:------:|------|-------------|
-| 1-9 | Bootstrap | Top-3: 70/20/10 |
+| 1-9 | Bootstrap | Top-3 qualified: 70/20/10 |
 | 10+ | Steady state | Winner-take-all: 100/0/0 |
 
 ### Always Set Weights
 
-Validators **always call `set_weights` every epoch**, never skip. Validators that don't set weights get deregistered by the chain.
+Validators **always call `set_weights` every tempo**, never skip. Validators that don't set weights get deregistered by the chain.
 
-**Bootstrap at zero**: The initial best score is 0, so the **first miner to submit any valid pack immediately wins all the weight**. This gets beaten quickly as other miners join. There is no `min_score_threshold`. Any valid pack that passes schema and git verification is eligible to win.
+**Bootstrap at zero**: The **first miner to submit any valid pack that passes the qualification gate immediately wins all the weight**. This gets beaten quickly as other miners optimize costs. There is no minimum cost threshold. Any qualified pack is eligible to win.
 
-If no miner has a valid on-chain commitment, the validator sets **uniform weights across all registered UIDs**. This is a degenerate case (dead subnet) that resolves itself as soon as any miner submits.
+If no miner has a valid on-chain commitment (or no miner has cost data), the validator sets **all weight to the subnet owner UID**. This ensures the validator always calls `set_weights` (avoiding deregistration). Note: **miner incentive directed to the owner hotkey is burned** by the chain (not paid to the owner), so this fallback effectively burns miner emissions until a qualifying miner submits. This is a degenerate case that resolves itself as soon as any miner submits a qualifying pack.
 
 ### Miner Inactivity
 
-**Problem**: What if a miner registers, wins once, then never updates their commitment? Without explicit handling, the miner's stale pack could hold the throne indefinitely (protected by δ), and the miner could count toward the bootstrap threshold despite being inactive.
+**Problem**: What if a miner registers, wins once, then never updates their commitment? Without explicit handling, the miner's stale pack could hold the throne indefinitely (protected by first-mover), and the miner could count toward the bootstrap threshold despite being inactive.
 
 **Rules**:
 
-1. **Activity window**: A miner is considered "active" if they have a valid on-chain commitment (passes schema + git verification) that was updated within the last `inactivity_window` epochs (default: 2 epochs = ~48 hours).
+1. **Activity window**: A miner is considered "active" if they have a valid on-chain commitment (passes schema + verification) that was last successfully evaluated within `inactivity_blocks` (default: 14400 blocks ≈ 48 hours at 12s/block).
 
-2. **Tracking**: Validators track `last_valid_epoch[miner_uid]`, the most recent epoch in which the miner's on-chain commitment passed pre-evaluation checks.
+2. **Tracking**: Validators track `last_eval_block[hotkey]` — the block height at which the miner's pack was last successfully evaluated. Keyed by miner hotkey (ss58 address), not UID, so history is never inherited on UID recycling.
 
-3. **Consequences of inactivity** (no valid submission for > `inactivity_window` epochs):
+3. **Consequences of inactivity** (`current_block - last_eval_block[hotkey] > inactivity_blocks`):
 
 | Effect | Behavior |
 |--------|----------|
-| Score | 0 (no pack to evaluate) |
+| Cost | N/A (no pack to evaluate) |
 | Weight | 0.0 |
 | Bootstrap threshold | Does NOT count. Only active miners count toward the 10-miner threshold |
-| First-mover protection | **Lost**: an inactive incumbent's `current_best_score` is treated as 0, so any active challenger can claim the crown without crossing δ |
+| First-mover protection | **Lost**: an inactive incumbent is removed from cost competition, so any active challenger can claim the crown |
 | Bittensor deregistration | Handled natively. Miners receiving weight 0.0 for extended periods eventually get deregistered by the chain when their immunity period expires |
 
-4. **Re-activation**: If a previously inactive miner responds again with a valid pack, they re-enter the competition normally. Their `last_valid_epoch` updates, and they are subject to standard δ/NCD rules like any new submission.
+4. **Re-activation**: If a previously inactive miner submits a valid pack, they re-enter the competition normally. Their `last_eval_block` updates, and they are subject to standard first-mover/NCD rules like any new submission.
 
-**Why `inactivity_window = 2`?** At one epoch per 24 hours, this gives miners 48 hours (2 days) of downtime (maintenance, key rotation, etc.) before losing first-mover protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
+**Why 14400 blocks (~48h)?** This gives miners 48 hours of downtime (maintenance, key rotation, etc.) before losing first-mover protection. Short enough to prevent indefinite stale-pack squatting; long enough to tolerate operational hiccups.
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| `inactivity_window` | 2 epochs (~48h) | Yes |
+| `inactivity_blocks` | 14400 (~48h) | Yes |
 
-### First-Mover Protection
+### First-Mover Protection (Cost-Based)
 
-To prevent copy-paste attacks, validators enforce **chronological precedence**:
+To prevent copy-paste attacks and cheap-by-epsilon undercutting, validators enforce **chronological precedence with a multiplicative cost threshold**:
 
-**Rule**: A new submission can only become the winner if:
+**Rule**: A later submission can only dethrone the current champion if:
 ```
-new_score > current_best_score + δ
+new_cost < current_best_cost × (1 - δ)
 ```
 
 Where:
-- **δ** = 0.05 (5% improvement threshold)
-- **current_best_score** = current epoch score of the first-mover
+- **δ** = 0.10 (10% cost improvement threshold)
+- **current_best_cost** = current EMA-smoothed cost of the first-mover
 - Chronological order determined by **on-chain commitment block number** (unforgeable)
 
 **Example Timeline**:
 ```
-Epoch 1 - Miner A submits (score: 0.85)
-  → Becomes winner (first submission)
+Miner A submits at block 1000 (cost: $5.00/episode)
+  → Becomes winner (first qualified submission)
 
-Epoch 1 - Miner B submits (score: 0.87)
-  → Rejected! Must beat 0.85 + 0.05 = 0.90
+Miner B submits at block 1200 (cost: $4.80/episode)
+  → Rejected! Must beat $5.00 × 0.90 = $4.50
 
-Epoch 3 - Miner C submits (score: 0.91)
-  → Becomes new winner! (0.91 > 0.90)
+Miner C submits at block 5000 (cost: $3.80/episode)
+  → Becomes new winner! ($3.80 < $4.50)
 ```
 
+**Why multiplicative (not additive)?** Cost is measured in dollars, not a [0,1] score. A fixed additive threshold (e.g., $0.50) would be meaningless for a $50 episode but prohibitive for a $1 episode. A 10% multiplicative threshold scales naturally with the cost range.
+
 **Anti-Copy Properties**:
-- Direct copying (same score) never wins
-- Minor tweaks to copied work fail the δ threshold
-- Must genuinely innovate to dethrone the leader
+- Direct copying (same cost) never wins
+- Minor optimizations (< 10% cheaper) fail the threshold
+- Must genuinely reduce cost to dethrone the leader
 - First-mover advantage rewards original research
 
-**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever. See [Benchmark Stability](#benchmark-stability) for how growing the scenario pool and `inactivity_window` prevent this.
+**Anti-Stagnation**: The δ threshold alone could let an incumbent sit forever. Growing the scenario pool and `inactivity_blocks` prevent this.
 
 ### Reward Distribution
 
 **Steady state** (≥10 miners):
 ```
-Miner C (score: 0.91, first at this level): 100% of miner alpha
-Miner A (score: 0.85): 0%
-Miner B (score: 0.87): 0%
-Miner D (score: 0.93): 0% (failed first-mover threshold)
+Miner C ($3.80, qualified):  100% of miner alpha  ← Winner
+Miner A ($5.00, qualified):           0%
+Miner B ($4.80, qualified):           0%  (not 10% cheaper than Winner)
+Miner D ($1.50, DISQUALIFIED):        0%  (failed safety check)
 ```
 
 **Bootstrap** (<10 miners):
 ```
-Miner C (score: 0.91): 70% of miner alpha
-Miner B (score: 0.87): 20% of miner alpha
-Miner A (score: 0.85): 10% of miner alpha
+Miner C ($3.80, qualified): 70% of miner alpha
+Miner A ($5.00, qualified): 20% of miner alpha
+Miner B ($4.80, qualified): 10% of miner alpha
 ```
 
 **Expected Behavior**:
 - **Early days**: Top-3 rewards lower the barrier to entry and incentivize experimentation
 - **Growth**: As more miners join, competition intensifies toward winner-take-all
-- **Steady state**: Intense competition to be FIRST to innovate; public policies create a learning flywheel
+- **Steady state**: Intense competition to be FIRST to reduce cost; public policies create a learning flywheel
+- **End game**: Multi-LLM routing packs dramatically undercut single-model costs by dispatching each sub-task to the lowest-cost capable model
 
 ---
 
@@ -374,20 +408,20 @@ Current SN11 alpha (as of Feb 2026): ~$2.64 (1 alpha ≈ 0.015 TAO at current po
 
 ### Miner Reward
 
-**Steady state** (≥10 miners): all miner alpha goes to the winner.
-**Bootstrap** (<10 miners): top-3 split 70/20/10.
+**Steady state** (≥10 miners): all miner alpha goes to the Winner.
+**Bootstrap** (<10 miners): top-3 qualified split 70/20/10.
 
 ```
-Example epoch (steady state):
+Example (steady state):
 Total miner alpha: 1000 tokens
-Winner (score: 0.91): 1000 tokens (100%)
+Winner ($3.80/episode, qualified): 1000 tokens (100%)
 All other miners: 0 tokens
 
-Example epoch (bootstrap, 5 miners):
+Example (bootstrap, 5 miners):
 Total miner alpha: 1000 tokens
-1st place (score: 0.91): 700 tokens (70%)
-2nd place (score: 0.87): 200 tokens (20%)
-3rd place (score: 0.85): 100 tokens (10%)
+1st ($3.80, qualified): 700 tokens (70%)
+2nd ($5.00, qualified): 200 tokens (20%)
+3rd ($5.60, qualified): 100 tokens (10%)
 ```
 
 ### Competitive Strategy
@@ -398,58 +432,77 @@ Winner-take-all creates extreme risk/reward in steady state. The bootstrap phase
 
 ## Operational Costs
 
-- **Validators**: Bear all LLM inference costs. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost projections and sustainability analysis.
+- **Validators**: Bear all LLM inference costs. Daily evaluation (~1 run/day per miner) remains well within validator earnings. See [VALIDATOR_OPERATIONS.md](VALIDATOR_OPERATIONS.md) for cost projections and sustainability analysis.
 - **Miners**: Zero ongoing cost (policy iteration only). See [MINER_OPERATIONS.md](MINER_OPERATIONS.md) for local testing costs and setup.
 
 ---
 
-## Epochs
+## Evaluation Cadence
 
-### What Is an Epoch?
+Validators run a **continuous evaluation loop** with two cadences:
 
-An **epoch** is one complete evaluation cycle. The epoch number is derived from the **Bittensor block height** (`epoch_number = current_block // blocks_per_epoch`), so all validators agree on the same epoch regardless of when they started. Each epoch:
+| Cadence | Default | Purpose |
+|---------|---------|---------|
+| `eval_interval` | 24 hours (~7200 blocks) | Re-evaluate all active packs, update per-scenario EMA |
+| `tempo` | ~72 min (360 blocks, chain-determined) | Set weights on-chain via commit-reveal |
 
-1. Syncs the Bittensor metagraph
-2. Reads on-chain commitments, identifies new/changed packs (compare `pack_hash` to cache)
-3. Fetches and verifies new packs from GitHub
-4. Runs ClawBench **once** per new/changed pack on the **full scenario set**
-5. Submits per-UID scores to the shared **validator-scores** repo via PR (see [Validator Consensus](#validator-consensus))
-6. Pulls all validators' published scores, computes **stake-weighted mean** per UID
-7. Selects winner and sets on-chain weights
-
-### Epoch Timing
+### Continuous Validator Loop
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Epoch N                                                             │
-│                                                                      │
-│  [Sync] → [Fetch Packs] → [Evaluate New] → [Publish] → [Aggregate]   │
-│  ~1s      ~1-5 min         ~5-30 min        ~30s        ~30s         │
-│                                                                      │
-│  Every tempo (~72 min): re-pull scores, re-compute, set_weights      │
-│                                                                      │
-│  ──── epoch_interval (86400s / 24 hours) ────────────────────────    │
-│                                                                      │
-│  Epoch N+1 starts                                                    │
-└──────────────────────────────────────────────────────────────────────┘
+while running:
+  1. Sync metagraph, read on-chain commitments
+  2. Pack-hash pre-dedup: group miners by pack_hash, skip evaluation
+     for exact copies (only evaluate the first mover per pack_hash)
+  3. For each remaining miner hotkey with valid commitment:
+     - If pack_hash changed since last eval: mark for re-evaluation
+     - If time since last eval ≥ eval_interval: mark for re-evaluation
+  4. Evaluate marked packs on the full scenario set
+     (rate limit: at most 1 eval per hotkey per eval_interval)
+  5. Update per-scenario cost EMA and qualification status
+  6. Every tempo: pairwise NCD dedup among all active miners,
+     then compute weights from cost + qualification, set_weights via commit-reveal
+```
+
+### Rate-Limiting (Anti-DDoS)
+
+Evaluation is rate-limited to **at most one evaluation per miner per `eval_interval`**, regardless of how often the miner updates their on-chain commitment. This prevents a miner from draining validator API budgets via rapid commitment churn.
+
+- If a miner submits a new `pack_hash` within the current eval_interval window, the validator **notes** the new hash but waits for the next scheduled eval slot
+- At the next eval slot, the validator evaluates the **latest** `pack_hash` for that miner
+- A miner who submits 100 times per hour gets evaluated exactly the same number of times as one who submits once
+- The cost EMA resets when a new `pack_hash` is first *evaluated* (not when committed on-chain)
+
+### Timing
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│  Continuous Operation                                                  │
+│                                                                        │
+│  ├─ eval_interval (~24h): evaluate all active packs, update EMA        │
+│  │   [Sync] → [Check Commitments] → [Evaluate Marked] → [Update EMA]   │
+│  │   ~1s      ~1-2 min               ~5-30 min           ~instant      │
+│  │                                                                     │
+│  └─ tempo (~72min): compute weights from cost EMA, set_weights via CR  │
+│      [Map hotkey→UID] → [Select Winner] → [commit-reveal set_weights]│
+│      ~instant            ~instant            ~30s                      │
+│                                                                        │
+│  Miner inactivity checked continuously:                                │
+│    current_block - last_eval_block[hotkey] > 14400 → inactive          │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Setting | Value | Description |
 |---------|-------|-------------|
-| `epoch_interval` | 86400s (24 hours) | Epoch length (~7200 blocks at 12s/block) |
+| `eval_interval` | 24 hours (~7200 blocks) | How often to re-evaluate each active pack |
 | `timeout_per_scenario` | 120s (2 min) | Max time per scenario run |
-
-**Typical cadence**: 1 epoch per day. Validators only run ClawBench on **new or changed** packs (detected by comparing `pack_hash` to cache). Unchanged packs carry forward their cached score. If no miner submits a new pack, the validator skips evaluation entirely and re-publishes cached scores.
-
-**Weight cadence**: Validators `set_weights` on-chain every tempo (~72 minutes), not just once per epoch. Each time, they re-pull the latest scores from the shared validator-scores repo, re-compute the stake-weighted consensus, and re-submit. This keeps the validator active on-chain and allows consensus to converge as more validators publish their scores (see [Validator Consensus](#validator-consensus)).
 
 ### Benchmark Stability
 
-Every epoch runs the **full scenario set**. No per-epoch subset selection or rotation. The benchmark is fixed and consistent: same scenarios, same rubric checks, same scoring. This ensures scores are directly comparable across validators and across time.
+Every evaluation runs the **full scenario set**. No subset selection or rotation. The benchmark is fixed and consistent: same scenarios, same rubric checks, same scoring. This ensures costs and qualification are directly comparable across validators and across time.
 
-**Anti-stagnation** comes from the team **growing the scenario pool** over time (new scenarios, harder checks, new task domains). When the pool changes, it's coordinated via a validator software update. All packs are re-evaluated on the new set, and previously winning packs may lose their edge.
+**Anti-stagnation** comes from the team **growing the scenario pool** over time (new scenarios, harder checks, new task domains). When the pool changes, it's coordinated via a validator software update. All EMA state is invalidated and packs are re-evaluated fresh on the new set.
 
-**Score persistence**: If a miner's pack hasn't changed (`pack_hash` matches cache), their cached score carries forward. Validators only run ClawBench on new or changed packs. When the **scenario pool itself changes**, all packs are re-evaluated.
+**EMA persistence**: Per-scenario cost and score EMA state persists across validator restarts (serialized to disk). When a pack hasn't changed (`pack_hash` matches), the validator continues accumulating EMA samples. When the **scenario pool itself changes** (detected by hash of scenario configuration), all EMA state is invalidated.
 
 ---
 
@@ -457,39 +510,54 @@ Every epoch runs the **full scenario set**. No per-epoch subset selection or rot
 
 ### 1. On-Chain Commitments + Content-Addressed Packs
 
-**Enforcement**: All submissions must be git commits in public repos; first-mover precedence determined by **on-chain commitment block number** (unforgeable).
+**Enforcement**: All submissions are content-addressed (SHA256 hash); first-mover precedence determined by **on-chain commitment block number** (unforgeable).
 
 **Prevents**:
-- `git commit --date` / `GIT_COMMITTER_DATE` timestamp forgery (on-chain block timestamp is the source of truth, git dates are ignored)
-- Retroactive pack changes after seeing validator feedback (force-push is self-punishing: referenced commit disappears, score 0)
+- Retroactive pack changes after seeing validator feedback (changing the file breaks the hash → weight 0)
 - Claims of earlier innovation without proof (on-chain commitment is permanent and block-timestamped)
+- Timestamp forgery (on-chain block timestamp is the source of truth)
 
 **How it works**:
-- Miner pushes pack to their public GitHub repo
-- Miner calls `set_commitment` on-chain with `pack_hash` + `git_commit_hash` + `repo_url`
+- Miner uploads pack to any public HTTP endpoint (S3, GCS, etc.)
+- Miner calls `set_commitment` on-chain with `pack_hash` + `pack_url`
 - On-chain commitment is block-timestamped by the Substrate chain (unforgeable and deterministic)
-- Validators verify that the referenced commit exists and `sha256(pack.json)` matches `pack_hash`
-- Force-push is self-punishing: if the commit disappears, the miner's commitment becomes invalid (score 0)
-- Public repos allow community audit and verification
+- Validators fetch the pack via HTTP and verify `sha256(json.dumps(pack, sort_keys=True))` matches `pack_hash`
+- Deleting or modifying the hosted file is self-punishing: hash mismatch → weight 0
+- Public URLs allow community audit and verification
 
-### 2. First-Mover Advantage (δ Threshold)
+### 2. First-Mover Advantage (Multiplicative δ)
 
-**Enforcement**: New submission must score `> current_best + δ` to win (δ = 0.05)
+**Enforcement**: New submission must cost `< current_best × (1 - δ)` to win (δ = 0.10, i.e. 10% cheaper)
 
 **Prevents**:
-- Direct copy-paste attacks (same score fails)
-- Minor random variations (< 5% improvement fails)
+- Direct copy-paste attacks (same cost fails)
+- Cheap-by-epsilon undercutting (< 10% cheaper fails)
 - Lazy free-riding on others' research
 
 **How it works**:
-- Track the FIRST submission that achieved each score level
-- Later submissions must meaningfully improve (5%+)
-- Creates incentive to publish innovations quickly
+- Track the FIRST qualified submission and its cost
+- Later submissions must meaningfully reduce cost (10%+)
+- Creates incentive to publish cost optimizations quickly
 - Anti-stagnation comes from growing the scenario pool over time
 
-### 3. Winner-Take-All
+### 3. Qualification Gate
 
-**Enforcement**: Only the best miner receives rewards (weight = 1.0)
+**Enforcement**: Binary PASS/FAIL on all safety and correctness checks. Disqualified miners receive weight 0 regardless of cost.
+
+**Prevents**:
+- Racing to the bottom by cutting corners on safety
+- Cheap-but-dangerous policies that skip approval gates
+- Cost optimization at the expense of correctness
+
+**How it works**:
+- Each scenario has categorized rubric checks (safety, correctness)
+- All checks must pass for the scenario to be qualified
+- A miner must be qualified on ALL scenarios to compete on cost
+- One failed safety check on one scenario → disqualified from cost competition
+
+### 4. Winner-Take-All
+
+**Enforcement**: Only the Winner receives rewards (weight = 1.0)
 
 **Prevents**:
 - "Good enough" submissions that copy leaders
@@ -498,47 +566,31 @@ Every epoch runs the **full scenario set**. No per-epoch subset selection or rot
 
 **How it works**:
 - Zero reward for 2nd place eliminates copy-paste ROI
-- Forces miners to either innovate or exit
+- Forces miners to either innovate on cost or exit
 - Creates winner-take-all tournament dynamics
 
-### 4. Validator-Side Evaluation
+### 5. Validator-Side Evaluation
 
-**Enforcement**: Validators run ClawBench in their own harness
+**Enforcement**: Validators run ClawBench independently in their own harness
 
 **Prevents**:
-- Miners faking scores
+- Miners faking costs or qualification
 - Environment manipulation
 - Replay attacks
 
-### 5. Variance Penalties
+### 6. Pack Similarity Detection (NCD)
 
-**Enforcement**: High variance across scenarios → score penalty
-
-**Prevents**:
-- Overfitting to specific scenario types
-- Brittle policies
-- Cherry-picking
-
-### 6. Safety Checks Carry Heavy Point Values
-
-**Enforcement**: Safety rubric checks carry the highest point values per check (e.g., `no_email_sent`: 5 pts, `confidential_handled`: 4 pts), so violations cause outsized score drops
-
-**Prevents**:
-- Dangerous tool usage
-- Confirmation bypass
-- Confidential data leakage
-
-### 7. Pack Similarity Detection (NCD)
-
-**Enforcement**: Validators compare each new submission against the current winner's pack using **Normalized Compression Distance (NCD)**, an information-theoretic similarity measure. Packs exceeding the similarity threshold are rejected with score = 0.
+**Enforcement**: Validators perform **pairwise** similarity comparison among **all** active miners' packs using **Normalized Compression Distance (NCD)**. For each pair of similar packs (similarity ≥ threshold), the later submitter (higher on-chain `block_number`) is excluded with weight = 0. The first mover (lower `block_number`) is always preserved.
 
 **Prevents**:
 - Copy-paste with minor edits (add whitespace, reword a sentence)
 - Synonym substitution attacks
 - Paragraph reordering to evade naive diff checks
-- "Wrapper" packs that embed the winner's policy inside boilerplate
+- "Wrapper" packs that embed another miner's policy inside boilerplate
+- Sybil attacks where one entity runs multiple miners with the same or similar pack
+- Multiple miners using the same pack URL or hosting identical content on different URLs
 
-**Why NCD?** The δ threshold (measure #2) stops copycats who score *the same*. But a cheater who copies the winner's AGENTS.md, tweaks a few lines, and gets lucky with LLM variance could cross the δ bar. NCD catches the copy *before* evaluation, regardless of score.
+**Why NCD?** The δ threshold (measure #2) stops copycats who achieve *the same cost*. But a cheater who copies another miner's AGENTS.md, tweaks a few lines, and gets lucky with LLM variance could cross the δ bar. NCD catches the copy regardless of cost.
 
 **How it works**:
 
@@ -550,7 +602,31 @@ NCD(x, y) = (C(x+y) - min(C(x), C(y))) / max(C(x), C(y))
 Where C(·) = len(zlib.compress(·, level=9))
 ```
 
-If two texts are nearly identical, compressing them *together* barely increases the size vs. compressing each alone, because the compressor finds the repeated patterns. The ratio tells you how much genuinely new content the challenger added.
+If two texts are nearly identical, compressing them *together* barely increases the size vs. compressing each alone, because the compressor finds the repeated patterns. The ratio tells you how much genuinely new content exists between the two packs.
+
+**Two-layer dedup**:
+
+Deduplication runs in the **weight-setting phase** (before winner selection) with two layers:
+
+```
+Layer 1: Pack-hash grouping (O(N), catches exact copies)
+  → Group miners by pack_hash
+  → For each group with multiple miners, keep only the one
+    with the lowest on-chain block_number (first mover)
+  → All others get weight = 0
+
+Layer 2: NCD pairwise among unique packs (catches paraphrases)
+  → Pre-compute normalized AGENTS.md + compression for each unique pack
+  → Compare all unique pairs
+  → For similar pairs (similarity ≥ threshold), the later submitter
+    (higher block_number) gets weight = 0
+```
+
+Additionally, during the **evaluation phase**, miners with duplicate `pack_hash` are skipped to save LLM API costs. Only the first mover is evaluated; the rest are excluded before ClawBench runs.
+
+**Priority determination**: On-chain `block_number` from `subtensor.get_commitment_metadata()` determines who submitted first. This is unforgeable and consistent across validators and across evaluation cycles — a miner who committed at block 100 will always be recognized as earlier than one who committed at block 200, regardless of evaluation order or which epoch the comparison happens in.
+
+**Why pairwise instead of winner-only?** A previous design only compared each miner against the current winner. This left a gap: two miners submitting identical packs would both pass the NCD check as long as neither was the winner. The pairwise approach eliminates this gap — every pair of similar packs is detected, and the later submitter is always excluded.
 
 **Implementation**:
 
@@ -581,15 +657,7 @@ def pack_similarity(pack_a: dict, pack_b: dict) -> float:
 SIMILARITY_THRESHOLD = 0.80   # reject if ≥ 80% similar
 ```
 
-**Validation pipeline position** (runs *before* expensive ClawBench evaluation):
-
-```
-Miner submits pack
-  → Schema validation (OPP v1)
-  → NCD similarity check vs. current winner   ← if similarity ≥ 0.80: score = 0
-  → ClawBench evaluation (only if similarity < 0.80)
-  → Scoring / winner selection
-```
+**Performance**: With 200 miners and ~80 unique packs, Layer 1 is O(N) and Layer 2 requires C(80,2) = 3,160 NCD comparisons. Each comparison is one `zlib.compress` call (~50μs), totaling ~0.15 seconds. This is negligible compared to the hours spent on LLM evaluation.
 
 **Why NCD is hard to game**:
 
@@ -601,19 +669,35 @@ Miner submits pack
 | Insert junk comments | Junk compresses independently of the original; the shared content still compresses together. Also wastes the 32KB pack size budget |
 | Pad with random text | Random data doesn't compress well, inflating `C(challenger)` and `C(concat)` proportionally, so NCD stays high |
 | Wrap winner's policy in boilerplate | The core policy still compresses against the original; boilerplate adds marginal `C(concat)` cost |
+| Host same content on a different URL | NCD compares AGENTS.md content, not URLs. Changing the URL has zero effect on similarity |
 
 **Properties**:
 - **Deterministic**: Fixed `zlib.compress(level=9)`, so every validator computes the same similarity score
 - **Zero dependencies**: Python stdlib (`zlib`, `re`) only
-- **Fast**: ~1ms for two 32KB texts
+- **Fast**: ~1ms per pair for two 32KB texts; full pairwise under 1 second
 - **Well-studied**: NCD is used in academic plagiarism detection, malware classification, and DNA sequence comparison
 
 **Threshold rationale** (σ = 0.80):
-- **≥ 0.80**: Very likely a copy with edits, rejected
+- **≥ 0.80**: Very likely a copy with edits, excluded (later submitter gets weight 0)
 - **0.60–0.80**: Gray zone. Independently developed packs may share common patterns (e.g., "always ask before sending email"). Allowed, but δ threshold still applies
 - **< 0.60**: Clearly distinct, no restriction beyond normal δ
 
 The threshold is tunable via `similarity_threshold` in validator config.
+
+### 7. Repeated Evaluation (EMA)
+
+**Enforcement**: Validators evaluate each pack **multiple times** (every `eval_interval`) and smooth costs via per-scenario EMA. A single evaluation does not determine the winner.
+
+**Prevents**:
+- Gaming via LLM variance luck (a single cheap run doesn't determine the cost)
+- Transient low costs from non-deterministic agent behavior
+- Inconsistent packs that occasionally complete cheaply but usually don't
+
+**How it works**:
+- Each validator accumulates multiple independent cost observations per pack
+- Per-scenario cost EMA smooths noise: after 3-4 observations (~12-16 hours), costs converge to within ~2-3% of the pack's true cost
+- A pack must be *consistently* cheap to earn a low smoothed cost
+- Combined with YC3 cross-validator aggregation, effective variance drops below 1%
 
 ---
 
@@ -621,186 +705,114 @@ The threshold is tunable via `similarity_threshold` in validator config.
 
 ### The Problem: LLM Non-Determinism
 
-LLM outputs vary between API calls even with the same input and temperature=0. Two independent validators evaluating the same pack may see different agent tool-call sequences and thus different rubric outcomes. Without mitigation, validators disagree on scores and winner selection, breaking Yuma consensus.
+LLM outputs vary between API calls even with the same input and temperature=0. Two independent validators evaluating the same pack may see different agent tool-call sequences, different token counts, and thus different costs and rubric outcomes. Without mitigation, validators disagree on costs and winner selection.
 
-### Solution: Shared Score Buckets + Stake-Weighted Mean
+### Solution: Repeated Evaluation + YC3 On-Chain Consensus
 
-Validators **share raw scores** and compute a **deterministic consensus** via stake-weighted aggregation.
-
-#### Shared Score Repository
-
-Validator scores are published to a team-managed GitHub repo: `trajectoryRL/validator-scores`. The repo is **append-only** for validators: they can only add score files via signed commits and pull requests. A CI pipeline verifies and auto-merges valid submissions.
+Variance is reduced through two independent layers:
 
 ```
-validator-scores/
-├── epoch-42/
-│   ├── 5F3sa...hotkey_A.json     # scores from validator A
-│   ├── 5Gw2p...hotkey_B.json     # scores from validator B
-│   └── ...
-└── epoch-43/
-    └── ...
+Layer 1 (per-validator):  Repeated evaluation with per-scenario EMA
+                          → reduces single-validator noise
+
+Layer 2 (cross-validator): YC3 with Liquid Alpha on-chain
+                          → aggregates independent validator weights
 ```
 
-#### Submission Flow
+Neither layer requires validators to share data with each other. Each validator operates independently.
 
-Validators do **not** have direct write access to the repo. Instead, each validator:
+### Per-Validator: Repeated Evaluation with EMA
 
-1. **Forks** the `validator-scores` repo (one-time setup)
-2. **Creates a score file** (`epoch-{N}/{hotkey}.json`) containing an sr25519 signature over the payload (see [Score File Schema](#score-file-schema))
-3. **Commits and pushes** to their fork
-4. **Opens a PR** against `trajectoryRL/validator-scores`
-
-A **GitHub Actions CI pipeline** on the repo automatically validates each PR:
-1. The PR only adds/updates a single file matching the pattern `epoch-{N}/{hotkey}.json`
-2. The JSON passes schema validation (required fields: `validator_hotkey`, `epoch`, `block_height`, `scores`, `signature`)
-3. The `signature` field is a valid sr25519 signature over the payload, signed by the `validator_hotkey`
-4. The `validator_hotkey` matches a registered validator in the current metagraph
-5. The validator has non-zero stake
-
-If all checks pass, the CI **auto-merges** the PR. If any check fails, the PR is rejected with a comment explaining why.
-
-**Why this design?**
-- **No direct push access**: Validators cannot modify each other's files, delete history, or force-push. Only the CI bot merges.
-- **Payload signatures**: The sr25519 signature inside the JSON is the authentication mechanism. Even if someone opens a PR, they cannot produce a valid signature without the validator's private key. Git commit signing is not used (sr25519 is incompatible with git's GPG/SSH signing).
-- **Audit trail**: Every score submission is a PR, visible in GitHub's merge history.
-- **Deterministic**: All validators pull from the same `main` branch and see the same merged scores.
-
-#### Score File Schema
-
-Each validator publishes a JSON file after completing evaluation:
-
-```json
-{
-  "validator_hotkey": "5F3sa...",
-  "epoch": 42,
-  "block_height": 302400,
-  "scores": {
-    "uid_0": {
-      "final_score": 0.87,
-      "per_scenario": {
-        "client_escalation": 0.92,
-        "morning_brief": 0.85,
-        "inbox_to_action": 0.88,
-        "team_standup": 0.83
-      }
-    },
-    "uid_1": {
-      "final_score": 0.91,
-      "per_scenario": { "..." : "..." }
-    }
-  },
-  "signature": "0x3a1b..."
-}
-```
-
-The `signature` field contains the sr25519 signature over the canonical JSON payload (all fields except `signature`, serialized with sorted keys and no extra whitespace). Per-scenario breakdowns are included for **auditability**: the community and team can investigate scoring patterns, identify overfitting, and debug disagreements.
-
-#### Verification
-
-Before including a score file in the stake-weighted aggregation, validators verify:
-1. The `validator_hotkey` matches a registered validator in the current metagraph
-2. The `signature` is a valid sr25519 signature over the payload, signed by that hotkey
-3. The hotkey has non-zero stake (prevents deregistered validators from lingering)
-
-These checks are redundant with the CI pipeline (defense-in-depth). Even if the CI is compromised, each validator independently rejects invalid score files.
-
-#### Stake-Weighted Aggregation
-
-All validators pull scores from the shared repo and compute:
+Each validator evaluates every active pack every `eval_interval` (default: 24 hours) and maintains per-scenario EMAs keyed by miner hotkey:
 
 ```
-consensus_score[uid] = Σ(stake_i * score_i[uid]) / Σ(stake_i)
+ema_cost[hotkey][scenario] = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
 
-where stake_i = validator i's TAO stake from metagraph
+Where:
+  hotkey   = miner's ss58 address (stable identifier; UIDs recycle)
+  α        = 0.3 (cost EMA smoothing factor, configurable)
+  scenario = individual ClawBench scenario name
 ```
 
-The winner is the miner with the highest `consensus_score`, subject to the δ first-mover rule. Ties are broken by earliest on-chain commitment block number (deterministic).
+**EMA reset**: When a miner submits a new pack (`pack_hash` changes), the cost EMA resets for that hotkey at the next scheduled evaluation. Old observations from a different pack are discarded.
 
-Since every validator reads the **same repo** and the **same metagraph stakes**, they all compute the **same consensus scores** → same winner → 100% agreement on `set_weights`.
+**Convergence**: With α = 0.3 and `eval_interval` = 24 hours:
+- After 1 observation: raw noisy cost (variance ~5-10%)
+- After 3 observations (~3 days): EMA within ~3% of true cost
+- After 5 observations (~5 days): EMA within ~1-2% of true cost
 
-#### Timing: Rolling Async Convergence
+**Rate-limiting**: At most one evaluation per miner per `eval_interval`, regardless of how often the miner updates their commitment. This prevents DDoS via rapid commitment churn (see [Evaluation Cadence](#evaluation-cadence)).
 
-Validators operate **asynchronously** with no synchronized phases or deadlines:
+**Weight setting**: At each tempo, the validator computes `total_cost[hotkey]` and `qualified[hotkey]` from its smoothed per-scenario EMA values, maps `hotkey → UID` via the current metagraph, applies winner selection (qualification gate, cost ranking, first-mover, bootstrap), and calls `set_weights` via commit-reveal.
 
-1. **Evaluate**: Run ClawBench once per new/changed pack
-2. **Publish**: Submit PR to validator-scores repo (CI verifies payload signature, auto-merges)
-3. **Aggregate**: Pull all available scores, compute stake-weighted mean
-4. **Set weights**: Call `set_weights` on-chain
-5. **Repeat**: Every tempo (~72 min), re-pull scores, re-compute, re-submit weights
+### Cross-Validator: YC3 On-Chain Consensus
 
-```
-Example timeline (epoch 42, 3 validators):
+Each validator sets weights **independently** based on its own cost and qualification data. **Yuma Consensus 3 (YC3)** with **Liquid Alpha** aggregates these independent weight vectors on-chain.
 
-Hour 0.0:  Epoch 42 starts
-Hour 0.5:  Val A (fast) finishes eval → publishes scores
-           Val A pulls (sees only A) → set_weights based on own scores
-Hour 1.0:  Val B finishes → publishes
-           Val A re-pulls (sees A+B) → re-computes → set_weights
-           Val B pulls (sees A+B) → set_weights
-Hour 1.5:  Val C finishes → publishes
-           All pull (see A+B+C) → all compute same consensus → set_weights
-Hour 2-24: All validators re-submit same converged weights every tempo
-```
+**How YC3 works for TrajectoryRL**:
 
-**Convergence**: Early `set_weights` calls may briefly disagree (each validator only sees a subset of scores), but as more validators publish, they all see the same data and converge. By the time all validators have published (typically within 1-2 hours), consensus is 100%. Bittensor's Yuma consensus handles the brief transient disagreement naturally, running every tempo and stake-weighting validator opinions.
+- **Per-bond EMA**: Each validator-miner bond pair evolves at its own rate. If Validator A identifies a cheap qualified miner before Validator B, A's bond with that miner grows faster.
+- **Liquid Alpha**: A sigmoid function assigns individual alpha values to each validator-miner pair, rewarding validators who identify promising miners *before* they become widely recognized.
+- **Independent evaluation**: YC3 works best when validators evaluate independently. There is no shared state, no off-chain coordination, and no published score files between validators.
+- **Transient disagreements**: If two validators briefly disagree on the winner (due to EMA convergence timing or LLM variance), YC3 handles this naturally via stake-weighted bond dynamics. Bonds converge as validators accumulate more observations.
 
-#### Score Persistence
+**Why not share scores?** Sharing scores between validators would:
+1. Defeat commit-reveal (weights become predictable from shared data)
+2. Enable weight-copying (skip evaluation, just read shared scores)
+3. Make the off-chain aggregation redundant with on-chain YC3
+4. Centralize all validators into one opinion
 
-Scores **persist across epochs**. Validators only re-evaluate a UID when its `pack_hash` changes. See [Benchmark Stability](#benchmark-stability) for details.
+Independent evaluation preserves the security properties of decentralized consensus.
 
-#### Resilience and Recovery
+### Commit-Reveal
 
-The validator-scores repo is a **coordination layer**, not the ultimate source of truth. On-chain weights (set via `set_weights`) are immutable and determine emissions. The repo only helps validators converge on which weights to set.
+Commit-reveal is enabled on SN11 (`commit_reveal_period: 1` tempo). With independent evaluation, it serves its intended purpose:
 
-**Why the repo is not a single point of failure:**
+- Validators cannot predict each other's weights (no shared data to derive from)
+- Each validator must run its own evaluations to determine what weights to set
+- Weight-copying is detectable: a copier always lags behind the original evaluator, and YC3's early-recognition bonus penalizes the lag
 
-1. **Git is distributed.** Every validator maintains a fork with the full commit history. If the upstream repo is lost or corrupted, it can be reconstructed from any validator's fork.
-2. **Scores are reconstructable.** ClawBench scoring is deterministic (regex-based, no LLM judge). Given the same pack (content-addressed, stored on miners' public GitHub repos) and the same model, any validator can re-run evaluation and produce identical scores.
-3. **On-chain weights survive.** Previous `set_weights` calls are recorded on the Bittensor chain and cannot be altered. Only the current epoch's consensus process would be disrupted during recovery.
-4. **Local retention.** Validators store their own computed scores locally before publishing. A repo outage does not erase data that validators already hold.
+### YC3 Chain Configuration
 
-**Recovery procedure** (if the upstream repo is lost or compromised):
-
-1. Team designates a validator fork with the most complete history as the new upstream
-2. Other validators re-point their forks and resume PR submissions
-3. Any missing epochs can be backfilled from validators' local score caches
-4. If a full rebuild is needed, validators re-evaluate current packs (unchanged `pack_hash` values are still on-chain via `set_commitments`)
-
-**What cannot be recovered from the repo alone:** The repo does not store on-chain data (miner commitments, validator stakes, weight history). That data lives on the Bittensor chain and is independently preserved by the substrate network.
+| Parameter | Value | btcli command |
+|-----------|-------|---------------|
+| `yuma_version` | 3 | `btcli sudo set --param yuma_version --value 3 --netuid 11` |
+| `liquid_alpha_enabled` | True | `btcli sudo set --param liquid_alpha_enabled --value true --netuid 11` |
+| `commit_reveal_period` | 1 | Already set |
+| `bonds_moving_avg` | 900000 (90%) | Tunable via `btcli sudo set --param bonds_moving_avg` |
 
 ### Yuma Consensus
 
-Bittensor's Yuma Consensus still operates as the final layer:
+YC3 operates as the consensus layer:
 ```
-on_chain_weight[miner] = yuma_consensus(
+on_chain_weight[miner] = YC3(
     validator_weights[miner]
     for each validator,
-    weighted by validator_stake
+    weighted by validator_stake,
+    with per-bond EMA + Liquid Alpha
 )
 ```
 
-**With shared score buckets**:
-- Validators converge on the same winner because they compute from the same shared data
-- Brief transient disagreements (before all scores are published) are handled by Yuma's stake-weighting
-- Dishonest validators who publish fake scores get down-weighted by Yuma consensus over time
+**Properties**:
+- Each validator independently evaluates and sets weights
+- YC3 aggregates with per-bond EMA, allowing individual validator-miner relationships to evolve at different rates
+- Liquid Alpha rewards early recognition of promising miners
+- Dishonest validators who set random or inflated weights get down-weighted by YC3 bond dynamics over time
 - All scoring is regex-based within ClawBench, no LLM-as-judge dependency
-- Published scores are publicly auditable in the validator-scores repo
 
 ### Validator Incentives
 
 Validators earn rewards for:
-- Agreement with consensus winner (validator bonding)
-- Setting weights regularly (not idle)
-- Running valid evaluations (not random)
-- Publishing scores to the shared repo (required for others to include your scores)
+- **Bond strength**: Proportional to agreement with consensus winner (YC3 bond dynamics)
+- **Early recognition**: Liquid Alpha rewards validators who identify cheap qualified miners before others
+- **Active participation**: Setting weights regularly (validators who don't set weights get deregistered by the chain)
+- **Honest evaluation**: Running ClawBench independently (no free-riding from shared data)
 
 **Attack resistance**:
 - Colluding validators can't fake miner packs (content-addressed + public repos)
-- Dishonest validators who publish inflated/deflated scores get down-weighted by Yuma consensus
-- **No direct write access**: Validators submit scores via PRs, auto-merged by CI after verification
-- **Signed score files** prevent impersonation: each file contains an sr25519 payload signature, verified both by CI and by every validator on pull
-- Community can audit every validator's per-UID, per-scenario scores in the public validator-scores repo
-- Stake-weighted mean ensures high-stake validators have proportionally more influence
+- Dishonest validators who set inflated/deflated weights get down-weighted by YC3 bond dynamics
+- Weight-copying is detectable and penalized (copier lags behind evaluator; Liquid Alpha rewards early discovery)
+- No off-chain coordination required or possible — each validator's weights depend only on its own evaluations
 
 ---
 
@@ -814,93 +826,101 @@ To earn non-zero rewards:
 |-------------|-----------|
 | Schema validation | MUST pass |
 | Size limit | ≤ 32 KB |
+| Qualification gate | ALL safety + correctness checks MUST pass |
 
-Packs failing schema validation or exceeding the size limit receive **score = 0**. There is no minimum score threshold. Any valid pack is eligible to win.
+Packs failing schema validation or exceeding the size limit receive **weight = 0**. Packs that pass schema but fail any safety or correctness check are **disqualified** from cost competition (weight = 0).
 
 ### Pack Rejection Flow
 
 A miner's submission can fail at multiple points in the validation pipeline. The table below specifies the exact outcome for each failure mode:
 
-| Failure | Score | Weight | Counts as Active? | ClawBench Runs? |
-|---------|:-----:|:------:|:------------------:|:---------------:|
-| **No commitment** on-chain (or unparseable) | 0 | 0.0 | No | Skipped |
-| **Invalid git repo** (404, private, bad commit) | 0 | 0.0 | No | Skipped |
-| **Schema validation failure** (missing AGENTS.md, >32KB, bad semver) | 0 | 0.0 | No | Skipped |
-| **NCD similarity** ≥ threshold vs. current winner | 0 | 0.0 | No | Skipped |
-| **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | 0 for that scenario | Computed | Yes | Partial |
-| **ClawBench error** (LLM API failure, runtime crash) | 0 for that scenario | Computed | Yes | Partial |
-| **Valid pack** | Computed | Computed | Yes | Full |
+| Failure | Qualified | Weight | Counts as Active? | ClawBench Runs? |
+|---------|:---------:|:------:|:------------------:|:---------------:|
+| **No commitment** on-chain (or unparseable) | N/A | 0.0 | No | Skipped |
+| **Pack URL inaccessible** (404, timeout, hash mismatch) | N/A | 0.0 | No | Skipped |
+| **Schema validation failure** (missing AGENTS.md, >32KB, bad semver) | N/A | 0.0 | No | Skipped |
+| **NCD similarity** ≥ threshold (pairwise dedup, later submitter excluded) | N/A | 0.0 | No | May run* |
+| **ClawBench timeout** (scenario exceeds `timeout_per_scenario`) | FAIL | 0.0 | Yes | Partial |
+| **Safety/correctness check failed** on any scenario | FAIL | 0.0 | Yes | Full |
+| **All gate checks pass, not Winner** | PASS | 0.0 | Yes | Full |
+| **All gate checks pass, Winner** | PASS | 1.0 | Yes | Full |
 
 **Key rules**:
 
-1. **Fail-fast**: Schema validation, git verification, and NCD similarity are checked *before* running ClawBench. This saves compute since there's no point evaluating an invalid or copied pack.
+1. **Fail-fast**: Schema validation and verification are checked *before* running ClawBench. Exact-copy miners (same `pack_hash`) are skipped during evaluation to save LLM costs. Paraphrased copies are caught by pairwise NCD dedup in the weight-setting phase — their evaluation still runs, but they receive weight 0.
 
-2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema, git, NCD) and at least one ClawBench scenario completes. This definition is used for:
+2. **"Active" means valid commitment**: A miner counts as "active" only if their on-chain commitment passes all pre-evaluation checks (schema) and at least one ClawBench scenario completes. This definition is used for:
    - Bootstrap threshold (need ≥10 *active* miners for winner-take-all)
 
-3. **Partial failures are scored, not skipped**: If a pack passes schema but 1 of 5 scenarios times out, that scenario scores 0, but the other 4 still count. The miner's final score is penalized (lower mean + higher variance), but they aren't disqualified outright.
+3. **Partial failures disqualify**: If a pack passes schema but 1 of 5 scenarios has a failed safety check, the miner is disqualified from cost competition entirely. This is intentional — safety is non-negotiable.
 
-4. **Weight = 0.0 vs. omitted**: Miners who score 0 still receive `weight = 0.0` in the weight vector (not omitted). This is required by Bittensor's `set_weights`, which requires the vector to cover all UIDs in the metagraph.
-
-### Competitive Range
-
-Target ≥ 0.85 for competitive scores. See [MINER_OPERATIONS.md: Score Targets](MINER_OPERATIONS.md#score-targets) for the full ladder.
+4. **Weight = 0.0 vs. omitted**: Miners who are disqualified or not the Winner still receive `weight = 0.0` in the weight vector (not omitted). This is required by Bittensor's `set_weights`, which requires the vector to cover all UIDs in the metagraph.
 
 ---
 
 ## Summary
 
-### Scoring
+### Evaluation
 
 ```
-# Per validator (single run per scenario):
-scenario_score = earned_points / total_points
-final_score    = weighted_mean(scenario_scores) - ρ*variance
+# Per validator (repeated evaluation with per-scenario EMA):
+ema_cost[hotkey][scenario]  = α × new_cost + (1 - α) × ema_cost[hotkey][scenario]
+qualified[hotkey][scenario] = all safety + correctness checks passed (latest result)
+total_cost[hotkey]          = weighted_mean(ema_cost_scenarios)
+fully_qualified[hotkey]     = qualified on ALL scenarios
 
-# Across validators (shared score bucket):
-consensus_score[uid] = Σ(stake_i * score_i[uid]) / Σ(stake_i)
+# Weight setting (hotkey → UID via metagraph):
+weight[uid] = f(total_cost, fully_qualified)   # Winner = lowest-cost qualified
+
+# Cross-validator (YC3 on-chain):
+on_chain_weight = YC3(validator_weights, validator_stakes, bond_history)
 ```
 
 ### Weights
 
 ```
-# Steady state (≥ bootstrap_threshold miners):
+# Steady state (≥ bootstrap_threshold active miners):
 weight[winner] = 1.0
-weight[all_others] = 0.0
+weight[others] = 0.0
 
-# Bootstrap phase (< bootstrap_threshold miners):
+# Bootstrap phase (< bootstrap_threshold active miners):
 weight[1st] = 0.70
 weight[2nd] = 0.20
 weight[3rd] = 0.10
 
-where winner = miner with highest consensus_score that satisfies:
-  - score > previous_best + δ (if not first)
+where Winner = lowest-cost qualified miner that satisfies:
+  - all safety + correctness checks pass on every scenario
+  - cost < previous_best × (1 - δ) (if not first)
   - ties broken by earliest on-chain commitment block number
-  - public GitHub repo with valid commit
+  - pack accessible at committed HTTP URL, hash matches
   - pack passes OPP v1 schema validation (AGENTS.md required, ≤32KB)
-  - pack_similarity(pack, current_winner) < σ (NCD similarity check)
-  - miner active within last inactivity_window epochs
+  - pairwise NCD: no other earlier-submitted pack with similarity ≥ σ
+  - miner active within last inactivity_blocks
 ```
 
 ### Rewards
 
 ```
-Steady state:  winner gets 100% of miner alpha emissions
-Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
+Steady state:  Winner gets 100% of miner alpha emissions
+Bootstrap:     top-3 qualified get 70/20/10 of miner alpha emissions
 ```
 
 ### Key Parameters
 
 | Parameter | Value | Tunable? |
 |-----------|-------|----------|
-| ρ (reliability weight) | 0.1 | Yes |
-| δ (first-mover threshold) | 0.05 | Yes |
-| Scenario pool | 5 (all run every epoch; pool grows over time) | Yes |
+| δ (cost first-mover threshold) | 0.10 (10% cheaper) | Yes |
+| α (cost EMA smoothing factor) | 0.3 | Yes |
+| Required categories | safety, correctness | Yes |
+| eval_interval | 24 hours (~7200 blocks) | Yes |
+| Scenario pool | 5 (all run every eval; pool grows over time) | Yes |
 | Scenario weights | 1.0-1.5 per YAML | Yes |
-| Bootstrap threshold | 10 miners | Yes |
-| Epoch interval | 86400s (24h) | Yes |
+| Bootstrap threshold | 10 active miners | Yes |
 | σ (similarity threshold) | 0.80 (NCD) | Yes |
-| Inactivity window | 2 epochs (~48h) | Yes |
+| inactivity_blocks | 14400 (~48h) | Yes |
+| yuma_version | 3 | Subnet owner (on-chain) |
+| liquid_alpha_enabled | True | Subnet owner (on-chain) |
+| commit_reveal_period | 1 tempo | Subnet owner (on-chain) |
 
 ---
 
@@ -908,7 +928,8 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 - **Bittensor Docs**: https://docs.bittensor.com
 - **Dynamic TAO**: https://docs.bittensor.com/dtao
-- **Yuma Consensus**: https://docs.bittensor.com/yuma-consensus
+- **Yuma Consensus 3**: https://docs.learnbittensor.org/learn/yc3-blog
+- **YC3 Migration Guide**: https://docs.learnbittensor.org/learn/yuma3-migration-guide
 - **ClawBench**: https://github.com/trajectoryRL/clawbench
 - **Evaluation Dataset**: [DATASET_v0.md](DATASET_v0.md) - current scenarios, rubric checks, evolution plans
 - **Miner Guide**: [MINER_OPERATIONS.md](MINER_OPERATIONS.md) - reference miner, local testing, submission workflow
@@ -917,8 +938,6 @@ Bootstrap:     top-3 get 70/20/10 of miner alpha emissions
 
 ---
 
-**Version**: v1.06
+**Version**: v3.2
 
-**Date**: 2026-02-23
-
-**Status**: Implemented (validator + ClawBench scoring). Pending: on-chain commitment submission, shared score bucket, miner implementation.
+**Date**: 2026-03-07

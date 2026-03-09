@@ -3,11 +3,11 @@
 Miners don't run a server. The workflow is:
     1. Write AGENTS.md (policy document)
     2. Build a pack.json (OPP v1 format)
-    3. Push to a public GitHub repo
+    3. Upload pack.json to a public HTTP endpoint
     4. Submit on-chain commitment via set_commitment
 
 The on-chain commitment is block-timestamped, establishing first-mover
-precedence. Validators read commitments and fetch packs from GitHub.
+precedence. Validators read commitments and fetch packs via HTTP.
 
 Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 """
@@ -15,7 +15,7 @@ Reference: INCENTIVE_MECHANISM.md § Submission Protocol
 import hashlib
 import json
 import logging
-import subprocess
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -26,6 +26,8 @@ from ..utils.commitments import parse_commitment
 
 logger = logging.getLogger(__name__)
 
+MAX_COMMITMENT_BYTES = 128
+
 
 class TrajectoryMiner:
     """TrajectoryRL miner for building and submitting policy packs.
@@ -34,7 +36,7 @@ class TrajectoryMiner:
 
         miner = TrajectoryMiner(wallet_name="miner", wallet_hotkey="default")
         pack = miner.build_pack(agents_md="path/to/AGENTS.md")
-        miner.submit(pack, repo="myuser/my-pack", git_commit="abc123...")
+        miner.submit(pack, pack_url="https://trajrl.com/samples/pack.json")
 
     Example (validate locally)::
 
@@ -46,15 +48,15 @@ class TrajectoryMiner:
 
     def __init__(
         self,
-        wallet_name: str = "miner",
-        wallet_hotkey: str = "default",
-        netuid: int = 11,
-        network: str = "finney",
+        wallet_name: Optional[str] = None,
+        wallet_hotkey: Optional[str] = None,
+        netuid: Optional[int] = None,
+        network: Optional[str] = None,
     ):
-        self.wallet_name = wallet_name
-        self.wallet_hotkey = wallet_hotkey
-        self.netuid = netuid
-        self.network = network
+        self.wallet_name = wallet_name or os.environ.get("WALLET_NAME", "miner")
+        self.wallet_hotkey = wallet_hotkey or os.environ.get("WALLET_HOTKEY", "default")
+        self.netuid = netuid if netuid is not None else int(os.environ.get("NETUID", "11"))
+        self.network = network or os.environ.get("NETWORK", "finney")
 
         # Lazy-init Bittensor (only needed for on-chain operations)
         self._wallet: Optional[bt.Wallet] = None
@@ -73,6 +75,15 @@ class TrajectoryMiner:
         if self._subtensor is None:
             self._subtensor = bt.Subtensor(network=self.network)
         return self._subtensor
+
+    def close(self):
+        """Close the Subtensor websocket so the process can exit cleanly."""
+        if self._subtensor is not None:
+            try:
+                self._subtensor.substrate.close()
+            except Exception:
+                pass
+            self._subtensor = None
 
     # ------------------------------------------------------------------
     # Pack building
@@ -105,7 +116,6 @@ class TrajectoryMiner:
         Returns:
             OPP v1 pack dict, ready for JSON serialization.
         """
-        # Read from file if path exists
         agents_content = _read_or_use(agents_md)
         soul_content = _read_or_use(soul_md) if soul_md else None
 
@@ -208,45 +218,32 @@ class TrajectoryMiner:
     @staticmethod
     def format_commitment(
         pack_hash: str,
-        git_commit_hash: str,
-        repo: str,
+        pack_url: str,
     ) -> str:
         """Format a commitment string for on-chain submission.
 
         Args:
             pack_hash: SHA256 hex of pack JSON (64 chars).
-            git_commit_hash: Git commit hash (40 chars).
-            repo: GitHub repo as "owner/repo" or full URL.
+            pack_url: HTTP(S) URL where the pack.json is hosted.
 
         Returns:
-            Pipe-delimited commitment string (≤128 bytes).
+            Pipe-delimited commitment string (≤256 bytes).
 
         Raises:
             ValueError: If inputs are invalid.
         """
         if len(pack_hash) != 64:
             raise ValueError(f"pack_hash must be 64 hex chars, got {len(pack_hash)}")
-        if len(git_commit_hash) != 40:
+        if not pack_url.startswith(("https://", "http://")):
+            raise ValueError(f"pack_url must be an HTTP(S) URL, got: {pack_url}")
+
+        commitment = f"{pack_hash}|{pack_url}"
+        if len(commitment.encode()) > MAX_COMMITMENT_BYTES:
             raise ValueError(
-                f"git_commit_hash must be 40 hex chars, got {len(git_commit_hash)}"
+                f"Commitment too long: {len(commitment.encode())} bytes "
+                f"(max {MAX_COMMITMENT_BYTES}). Use a shorter URL."
             )
 
-        # Use shorthand if full URL provided
-        if repo.startswith("https://github.com/"):
-            repo = repo[len("https://github.com/"):]
-
-        # Strip trailing slashes and .git
-        repo = repo.rstrip("/")
-        if repo.endswith(".git"):
-            repo = repo[:-4]
-
-        commitment = f"{pack_hash}|{git_commit_hash}|{repo}"
-        if len(commitment.encode()) > 128:
-            raise ValueError(
-                f"Commitment too long: {len(commitment.encode())} bytes (max 128)"
-            )
-
-        # Verify round-trip
         parsed = parse_commitment(commitment)
         if parsed is None:
             raise ValueError(f"Commitment failed round-trip validation: {commitment}")
@@ -256,32 +253,80 @@ class TrajectoryMiner:
     def submit_commitment(
         self,
         pack_hash: str,
-        git_commit_hash: str,
-        repo: str,
+        pack_url: str,
     ) -> bool:
         """Submit on-chain commitment via set_commitment.
 
         Args:
             pack_hash: SHA256 hex of pack JSON.
-            git_commit_hash: Git commit hash of the pack in the repo.
-            repo: GitHub repo ("owner/repo" or full URL).
+            pack_url: HTTP(S) URL where pack.json is publicly accessible.
 
         Returns:
             True if commitment was submitted successfully.
         """
-        commitment = self.format_commitment(pack_hash, git_commit_hash, repo)
+        commitment = self.format_commitment(pack_hash, pack_url)
         logger.info(f"Submitting commitment: {commitment}")
 
         try:
-            self.subtensor.set_commitment(
+            result = self.subtensor.set_commitment(
                 wallet=self.wallet,
                 netuid=self.netuid,
                 data=commitment,
             )
-            logger.info("Commitment submitted successfully!")
+            if result is False or (result is not None and result is not True and not result):
+                logger.error("set_commitment returned failure: %s", result)
+                return False
+
+            block = self.subtensor.get_current_block()
+            logger.info(
+                "Commitment submitted at block %d (first-mover precedence)",
+                block,
+            )
+
+            # Verify the commitment actually landed on-chain
+            stored = self.get_current_commitment()
+            if stored is None:
+                logger.warning(
+                    "Commitment not found on-chain after submission. "
+                    "It may take a few blocks to finalize, or the extrinsic may have failed silently."
+                )
+                return False
+
+            parsed = parse_commitment(stored)
+            if parsed and parsed[0] == pack_hash:
+                logger.info("On-chain verification passed: hash matches")
+            else:
+                logger.warning(
+                    "On-chain commitment mismatch: expected hash %s..., got: %s",
+                    pack_hash[:16], stored[:40] if stored else "(empty)",
+                )
+                return False
+
             return True
+        except bt.NotRegisteredError:
+            logger.error(
+                "Miner hotkey is not registered on subnet %d. "
+                "Run: btcli subnet register --netuid %d --wallet.name %s --wallet.hotkey %s",
+                self.netuid, self.netuid, self.wallet_name, self.wallet_hotkey,
+            )
+            return False
+        except bt.ChainConnectionError as e:
+            logger.error(
+                "Cannot connect to %s network. Check network connectivity "
+                "and that the chain endpoint is reachable: %s", self.network, e,
+            )
+            return False
+        except bt.KeyFileError as e:
+            logger.error(
+                "Wallet key file error: %s. "
+                "Check wallet exists with: btcli wallet list", e,
+            )
+            return False
+        except bt.ChainTransactionError as e:
+            logger.error("Chain transaction failed: %s", e)
+            return False
         except Exception as e:
-            logger.error(f"Failed to submit commitment: {e}")
+            logger.error("Failed to submit commitment (%s): %s", type(e).__name__, e)
             return False
 
     def get_current_commitment(self) -> Optional[str]:
@@ -294,71 +339,20 @@ class TrajectoryMiner:
             hotkey = self.wallet.hotkey.ss58_address
             commitments = self.subtensor.get_all_commitments(netuid=self.netuid)
             return commitments.get(hotkey)
+        except bt.ChainConnectionError as e:
+            logger.error(
+                "Cannot connect to %s network. Check network connectivity "
+                "and that the chain endpoint is reachable: %s", self.network, e,
+            )
+            return None
+        except bt.KeyFileError as e:
+            logger.error(
+                "Wallet key file error: %s. "
+                "Check wallet exists with: btcli wallet list", e,
+            )
+            return None
         except Exception as e:
-            logger.error(f"Failed to read commitment: {e}")
-            return None
-
-    # ------------------------------------------------------------------
-    # Git helpers (for push workflow)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def git_push_pack(
-        pack: dict,
-        repo_path: str,
-        commit_message: str = "Update policy pack",
-    ) -> Optional[str]:
-        """Write pack.json to a local git repo, commit, and push.
-
-        Args:
-            pack: OPP v1 pack dict.
-            repo_path: Path to local git repository.
-            commit_message: Git commit message.
-
-        Returns:
-            Git commit hash if successful, None on failure.
-        """
-        repo = Path(repo_path)
-        if not (repo / ".git").exists():
-            logger.error(f"Not a git repository: {repo_path}")
-            return None
-
-        # Write pack.json
-        pack_path = repo / "pack.json"
-        canonical = json.dumps(pack, sort_keys=True, indent=2)
-        pack_path.write_text(canonical)
-
-        # Also write AGENTS.md as standalone for readability
-        agents_md = pack.get("files", {}).get("AGENTS.md", "")
-        if agents_md:
-            (repo / "AGENTS.md").write_text(agents_md)
-
-        try:
-            # Stage, commit, push
-            subprocess.run(
-                ["git", "add", "pack.json", "AGENTS.md"],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "commit", "-m", commit_message],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "push"],
-                cwd=repo_path, check=True, capture_output=True,
-            )
-
-            # Get commit hash
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo_path, check=True, capture_output=True, text=True,
-            )
-            commit_hash = result.stdout.strip()
-            logger.info(f"Pushed pack to {repo_path} (commit: {commit_hash[:12]}...)")
-            return commit_hash
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Git operation failed: {e.stderr.decode() if e.stderr else e}")
+            logger.error("Failed to read commitment (%s): %s", type(e).__name__, e)
             return None
 
     # ------------------------------------------------------------------
@@ -368,22 +362,17 @@ class TrajectoryMiner:
     def submit(
         self,
         pack: dict,
-        repo: str,
-        git_commit: Optional[str] = None,
-        repo_path: Optional[str] = None,
+        pack_url: str,
     ) -> bool:
-        """Full submission workflow: validate, optionally push, commit on-chain.
+        """Full submission workflow: validate + commit on-chain.
 
         Args:
             pack: OPP v1 pack dict.
-            repo: GitHub repo ("owner/repo" or full URL).
-            git_commit: Git commit hash. If None, pushes pack via repo_path.
-            repo_path: Local git repo path (used if git_commit is None).
+            pack_url: Public URL where pack.json is hosted.
 
         Returns:
             True if everything succeeded.
         """
-        # 1. Validate locally
         result = self.validate(pack)
         if not result.passed:
             logger.error(f"Pack validation failed: {result.issues}")
@@ -393,17 +382,7 @@ class TrajectoryMiner:
         logger.info(f"Pack hash: {pack_hash}")
         logger.info(f"Pack size: {len(json.dumps(pack))} bytes")
 
-        # 2. Push to GitHub if no commit hash provided
-        if git_commit is None:
-            if repo_path is None:
-                logger.error("Must provide either git_commit or repo_path")
-                return False
-            git_commit = self.git_push_pack(pack, repo_path)
-            if git_commit is None:
-                return False
-
-        # 3. Submit on-chain
-        return self.submit_commitment(pack_hash, git_commit, repo)
+        return self.submit_commitment(pack_hash, pack_url)
 
 
 def _read_or_use(value: str) -> str:
