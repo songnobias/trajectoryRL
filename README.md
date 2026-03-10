@@ -94,8 +94,8 @@ WALLET_HOTKEY=default
 NETUID=11
 NETWORK=finney
 CLAWBENCH_LLM_API_KEY=your-api-key
-CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1
-CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5-TEE
+CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
 EOF
 ```
 
@@ -105,9 +105,9 @@ EOF
 | `WALLET_HOTKEY` | Yes | Hotkey name (usually `default`) |
 | `NETUID` | Yes | Subnet UID (`11`) |
 | `NETWORK` | Yes | `finney`, `test`, or `local` |
-| `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Chutes](https://chutes.ai)) |
+| `CLAWBENCH_LLM_API_KEY` | Yes | API key for the LLM provider (e.g. [Zhipu AI](https://bigmodel.cn), [Chutes](https://chutes.ai)) |
 | `CLAWBENCH_LLM_BASE_URL` | Yes | Base URL for the OpenAI-compatible API |
-| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `chutes/zai-org/GLM-5-TEE`) |
+| `CLAWBENCH_DEFAULT_MODEL` | Yes | LLM model for evaluation (default: `zhipu/glm-5`) |
 
 #### 3. Start validator
 
@@ -136,36 +136,54 @@ btcli wallet create --wallet-name my-miner
 btcli subnets register --wallet-name my-miner --hotkey default --netuid 11
 ```
 
-#### 2. Quick test (demo mode)
+#### 2. Configure environment
+
+```bash
+cat > .env.miner <<'EOF'
+WALLET_NAME=my-miner
+WALLET_HOTKEY=default
+NETUID=11
+NETWORK=finney
+LLM_API_KEY=your-api-key
+LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+LLM_MODEL=zhipu/glm-5
+EOF
+```
+
+#### 3. Start mining
 
 ```bash
 git clone https://github.com/trajectoryRL/trajectoryRL.git
 cd trajectoryRL
 pip install -e .
 
-# Submit a sample pack to verify wallet + on-chain setup
-python neurons/miner.py run --mode demo
+# Run in default mode: generates AGENTS.md → builds pack → uploads → submits
+python neurons/miner.py run --mode default
 ```
 
-#### 3. Write your own pack
+> **Note**: Simply letting the LLM randomly generate AGENTS.md may not get you a good score. You need to actively optimize and improve your policy pack — study the ClawBench scenarios, understand what makes an agent perform well, and iteratively refine your prompts, tool rules, and stop conditions.
+
+#### 4. Manual operations (optional)
 
 ```bash
-# Build a pack from your AGENTS.md
+# Build pack from your own AGENTS.md
 python neurons/miner.py build --agents-md ./AGENTS.md -o pack.json
 
-# Upload pack.json to any public URL, then submit
-python neurons/miner.py submit https://your-server.com/pack.json
+# Validate pack locally
+python neurons/miner.py validate pack.json
 
-# Check status
+# Check on-chain status
 python neurons/miner.py status
 ```
 
-#### 4. Local testing with ClawBench
+#### 5. Local testing with ClawBench
 
 ```bash
 cd clawbench
 pip install -e .
 # Set CLAWBENCH_LLM_API_KEY, CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL in .env
+# Example Zhipu: CLAWBENCH_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4/, CLAWBENCH_DEFAULT_MODEL=zhipu/glm-5
+# Example Chutes: CLAWBENCH_LLM_BASE_URL=https://llm.chutes.ai/v1, CLAWBENCH_DEFAULT_MODEL=chutes/zai-org/GLM-5-TEE
 
 # Test a single scenario
 python scripts/run_episode.py --scenario inbox_triage --variant optimized --json
