@@ -114,6 +114,12 @@ class TrajectoryValidator:
         # Per-scenario qualification (latest, not EMA): {hotkey: {scenario: bool}}
         self.scenario_qualified: Dict[str, Dict[str, bool]] = {}
 
+        # Latest token usage per hotkey/scenario: {hotkey: {scenario: {input_tokens, ...}}}
+        self.latest_token_usage: Dict[str, Dict[str, Dict[str, int]]] = {}
+
+        # Latest model usage per hotkey/scenario: {hotkey: {scenario: [model_entry, ...]}}
+        self.latest_model_usage: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
         # Track the pack_hash that each hotkey's EMA is based on.
         # EMA resets when pack_hash changes.
         self._ema_pack_hash: Dict[str, str] = {}
@@ -236,6 +242,8 @@ class TrajectoryValidator:
             self.ema_scores[hotkey] = {}
             self.ema_costs[hotkey] = {}
             self.scenario_qualified[hotkey] = {}
+            self.latest_token_usage.pop(hotkey, None)
+            self.latest_model_usage.pop(hotkey, None)
             self._ema_pack_hash[hotkey] = pack_hash
 
         # Score EMA (informational, kept for logging)
@@ -609,6 +617,12 @@ class TrajectoryValidator:
                 self.last_eval_block[hotkey] = current_block
                 evaluated_count += 1
 
+                # Store latest token & model usage for metadata reporting
+                if eval_result.get("token_usage"):
+                    self.latest_token_usage[hotkey] = eval_result["token_usage"]
+                if eval_result.get("model_usage"):
+                    self.latest_model_usage[hotkey] = eval_result["model_usage"]
+
                 # First-mover tracks cost (lower = better)
                 total_cost = self.compute_total_cost_from_ema(hotkey)
                 if total_cost is not None:
@@ -823,6 +837,8 @@ class TrajectoryValidator:
         scenario_scores: Dict[str, float] = {}
         scenario_costs: Dict[str, float] = {}
         scenario_qualified: Dict[str, bool] = {}
+        scenario_token_usage: Dict[str, Dict[str, int]] = {}
+        scenario_model_usage: Dict[str, List[Dict[str, Any]]] = {}
 
         for scenario_name in eval_scenarios:
             try:
@@ -838,6 +854,10 @@ class TrajectoryValidator:
                 scenario_qualified[scenario_name] = result.success
                 if result.cost_usd is not None:
                     scenario_costs[scenario_name] = result.cost_usd
+                if result.token_usage:
+                    scenario_token_usage[scenario_name] = result.token_usage
+                if result.model_usage:
+                    scenario_model_usage[scenario_name] = result.model_usage
 
                 cost_str = f", cost=${result.cost_usd:.4f}" if result.cost_usd is not None else ""
                 gate_str = "PASS" if result.success else "FAIL"
@@ -889,6 +909,8 @@ class TrajectoryValidator:
             "scores": scenario_scores,
             "costs": scenario_costs,
             "qualified": scenario_qualified,
+            "token_usage": scenario_token_usage,
+            "model_usage": scenario_model_usage,
         }
 
     # ------------------------------------------------------------------
@@ -942,6 +964,13 @@ class TrajectoryValidator:
             ema_costs = self.ema_costs.get(hk, {})
             qualified_scenarios = self.scenario_qualified.get(hk, {})
 
+            # Latest token/model usage for this miner
+            hk_token_usage = self.latest_token_usage.get(hk, {})
+            hk_model_usage = self.latest_model_usage.get(hk, {})
+
+            # Aggregate token totals across scenarios
+            total_tokens: Dict[str, int] = {}
+
             for scenario_name in self.scenarios.keys():
                 scenario_entry: Dict[str, Any] = {
                     "score": round(ema_scores.get(scenario_name, 0.0), 4),
@@ -951,9 +980,21 @@ class TrajectoryValidator:
                 scenario_cost = ema_costs.get(scenario_name)
                 if scenario_cost is not None:
                     scenario_entry["cost"] = round(scenario_cost, 4)
+                # Per-scenario token usage
+                s_tokens = hk_token_usage.get(scenario_name)
+                if s_tokens:
+                    scenario_entry["token_usage"] = s_tokens
+                    for k, v in s_tokens.items():
+                        total_tokens[k] = total_tokens.get(k, 0) + v
+                # Per-scenario model usage
+                s_models = hk_model_usage.get(scenario_name)
+                if s_models:
+                    scenario_entry["model_usage"] = s_models
                 scenario_scores[scenario_name] = scenario_entry
 
             entry["scenario_scores"] = scenario_scores
+            if total_tokens:
+                entry["total_token_usage"] = total_tokens
             miner_scores[hk] = entry
 
         self._report_metadata["miner_scores"] = miner_scores
