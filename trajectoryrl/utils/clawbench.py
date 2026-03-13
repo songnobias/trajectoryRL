@@ -463,7 +463,7 @@ class ClawBenchHarness:
             raise ValueError(f"run_episode.py not found: {run_script}")
 
         cmd = [
-            "python",
+            "python3",
             str(run_script),
             "--scenario", scenario_name,
             "--workspace", str(workspace),

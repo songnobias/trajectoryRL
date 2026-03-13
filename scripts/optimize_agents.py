@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 optimize_agents.py — Optimize AGENTS.md for ClawBench, then build & submit.
 
@@ -19,6 +20,13 @@ Optimization strategies:
   - optimize --strategy dspy: DSPy declarative modules + MIPROv2-style prompt optimization
     (requires: pip install dspy-ai).
 
+Production evaluation (validator v4.0): Uses LLM-as-judge (Phase 1 pack integrity +
+Phase 2 trajectory evaluation). Claims must be GROUNDED in tool-retrieved data.
+Keyword stuffing fails — zero tool calls with detailed response = FAIL.
+
+For production-parity testing, use: python scripts/eval_pack.py --pack pack.json
+(uses ClawBenchHarness + epoch context; validator additionally runs LLM trajectory judge).
+
 Env (.env): ANTHROPIC_API_KEY, CLAWBENCH_MODEL. For Docker: CLAWBENCH_LLM_API_KEY,
 CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL (see clawbench/.env.example).
 """
@@ -37,11 +45,7 @@ from pathlib import Path
 import httpx
 import yaml
 
-try:
-    import anthropic
-except ImportError:
-    print("ERROR: pip install anthropic")
-    sys.exit(1)
+# anthropic imported lazily in generate/loop/optimize (not needed for test/pipeline/analyze)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -81,14 +85,18 @@ def load_all_scenarios() -> dict:
 
 
 def build_rubric_analysis(scenarios: dict) -> str:
-    """Build a comprehensive analysis of all scoring checks for the LLM prompt."""
+    """Build a comprehensive analysis of all scoring checks for the LLM prompt.
+
+    Supports both scoring.checks (regex-based) and scoring.criteria (LLM-judge format).
+    """
     lines = []
     total_points = 0
     total_checks = 0
 
     for name, config in scenarios.items():
         weight = config.get("weight", 1.0)
-        checks = config.get("scoring", {}).get("checks", [])
+        scoring = config.get("scoring", {})
+        checks = scoring.get("checks") or scoring.get("criteria", [])
         scenario_pts = sum(c.get("points", 1) for c in checks)
         total_points += scenario_pts
         total_checks += len(checks)
@@ -236,7 +244,7 @@ def compute_ncd_similarity(text_a: str, text_b: str) -> float:
 # LLM generation
 # ---------------------------------------------------------------------------
 def generate_agents_md(
-    client: anthropic.Anthropic,
+    client: "anthropic.Anthropic",
     rubric_analysis: str,
     fixture_summary: str,
     current_agents: str | None = None,
@@ -266,6 +274,9 @@ CRITICAL CONSTRAINTS:
 - Under 30KB total (pack overhead).
 - NCD similarity < 80% to baseline — use different structure, headings, phrasing.
 - Must work across ALL 5 scenarios simultaneously.
+- GROUNDING: Production uses LLM-as-judge. Every factual claim MUST be traceable to data
+  retrieved via tool calls. Zero tool calls with a detailed response = FAIL. Instruct the
+  agent to ALWAYS use tools to gather data before synthesizing; never fabricate or assume.
 
 CHECK TYPES TO HANDLE:
 - response_contains / response_excludes: regex on final response text
@@ -363,6 +374,12 @@ Analyze each check's regex pattern carefully. Here's what each scenario needs:
 - Keep total tools ≤ 7
 - Skip #random channel content (no "ramen"/"lunch"/"Market St")
 - MUST use memory_search or memory_get
+
+## GROUNDING (production LLM-as-judge requirement):
+The validator uses Phase 2 trajectory evaluation. The judge verifies claims are GROUNDED
+in tool-retrieved data. A response with zero tool calls that contains specific claims
+(e.g., root cause, fix status, customer names) ALWAYS fails. Instruct: gather via tools
+first, then synthesize. Never fabricate, assume, or echo without retrieval.
 
 ## COST MINIMIZATION (critical for champion):
 Among qualified miners, LOWEST COST wins. Cost ≈ tool calls + response length.
@@ -589,7 +606,9 @@ def collect_failed_checks(test_results: dict, scenarios: dict | None = None) -> 
     failed = []
     for scenario_name, result in test_results.get("scenarios", {}).items():
         config = (scenarios or {}).get(scenario_name, {})
-        scenario_checks = {c["id"]: c for c in config.get("scoring", {}).get("checks", [])}
+        scoring = config.get("scoring", {})
+        raw_checks = scoring.get("checks") or scoring.get("criteria", [])
+        scenario_checks = {c["id"]: c for c in raw_checks if "id" in c}
         for check in result.get("checks", []):
             if not check.get("passed", True):
                 orig = scenario_checks.get(check["id"], {})
@@ -625,7 +644,7 @@ def _format_wrong_examples_metasco(failed_checks: list[dict], scenarios: dict) -
 
 
 def _metasco_analyze_system_prompt(
-    client: anthropic.Anthropic,
+    client: "anthropic.Anthropic",
     current_agents: str,
     wrong_examples: str,
 ) -> str:
@@ -654,7 +673,7 @@ Follow these instructions carefully:
 
 
 def _metasco_generate_candidate(
-    client: anthropic.Anthropic,
+    client: "anthropic.Anthropic",
     current_agents: str,
     analysis: str,
     rubric: str,
@@ -750,136 +769,13 @@ def _dspy_generate_if_available(
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-def cmd_optimize(args):
-    """MetaSPO-inspired or DSPy-based system prompt optimization."""
-    if not ANTHROPIC_API_KEY:
-        print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
-        sys.exit(1)
-
-    if not services_ready():
-        print("ERROR: ClawBench services not running. Start with:")
-        print("  cd clawbench && docker compose up -d")
-        sys.exit(1)
-
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    scenarios = load_all_scenarios()
-    rubric = build_rubric_analysis(scenarios)
-    fixtures = build_fixture_summary(scenarios)
-
-    current = (ROOT / "AGENTS.md").read_text() if (ROOT / "AGENTS.md").exists() else None
-    if not current:
-        print("No existing AGENTS.md. Generating initial candidate via loop...")
-        current, _ = generate_agents_md(client, rubric, fixtures, iteration=1)
-
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    strategy = (args.strategy or "metasco").lower()
-    num_candidates = getattr(args, "num_candidates", 3) or 3
-    max_iterations = getattr(args, "max_rounds", 3) or 3
-
-    best_qualified = False
-    best_cost_proxy = float("inf")
-    best_score = -1.0
-    best_candidate = current
-    best_results = None
-
-    print(f"\nOptimize AGENTS.md | strategy={strategy} | candidates={num_candidates} | iterations={max_iterations}")
-    print("=" * 60)
-
-    for iteration in range(1, max_iterations + 1):
-        print(f"\n--- Outer loop {iteration}/{max_iterations} ---")
-
-        # 1. Evaluate current across all scenarios
-        print("[1/4] Evaluating current AGENTS.md...")
-        results = test_all_scenarios(current, scenarios)
-        failed_checks = collect_failed_checks(results, scenarios)
-        qual = results.get("qualified", False)
-        cost_proxy = results.get("cost_proxy", 0)
-        final_score = results.get("final_score", 0.0)
-
-        print(f"  Qualified: {'YES' if qual else 'NO'} | Score: {final_score:.4f} | Cost: {cost_proxy:.0f}")
-        if not failed_checks:
-            print("  All checks passed!")
-            best_candidate = current
-            best_qualified = qual
-            best_cost_proxy = cost_proxy
-            best_score = final_score
-            break
-
-        # 2. Failure analysis (MetaSPO Table 8)
-        print("[2/4] MetaSPO failure analysis...")
-        wrong_examples = _format_wrong_examples_metasco(failed_checks, scenarios)
-        analysis = _metasco_analyze_system_prompt(client, current, wrong_examples)
-        print(f"  Analysis length: {len(analysis)} chars")
-
-        # 3. Generate N candidates
-        candidates = [current]  # Include current in pool
-        use_dspy = strategy == "dspy"
-        if use_dspy:
-            dspy_out = _dspy_generate_if_available(rubric, fixtures, current, analysis, failed_checks)
-            if dspy_out:
-                candidates.append(dspy_out)
-                print("[3/4] DSPy candidate generated")
-        for i in range(num_candidates - (2 if use_dspy and len(candidates) > 1 else 1)):
-            cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
-            if cand and len(cand) > 500:
-                candidates.append(cand)
-        if len(candidates) == 1:
-            print("[3/4] Generating MetaSPO candidates...")
-            for _ in range(num_candidates - 1):
-                cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
-                if cand and len(cand) > 500:
-                    candidates.append(cand)
-        print(f"  Pool: {len(candidates)} candidates")
-
-        # 4. Evaluate all candidates, select best
-        print("[4/4] Evaluating candidates...")
-        best_of_round = current
-        best_of_round_qual = qual
-        best_of_round_cost = cost_proxy
-        best_of_round_score = final_score
-        for idx, cand in enumerate(candidates):
-            if cand == current and idx > 0:
-                continue
-            r = test_all_scenarios(cand, scenarios)
-            q = r.get("qualified", False)
-            c = r.get("cost_proxy", float("inf"))
-            s = r.get("final_score", 0.0)
-            if q and not best_of_round_qual:
-                best_of_round, best_of_round_qual, best_of_round_cost, best_of_round_score = cand, True, c, s
-            elif q and best_of_round_qual and c < best_of_round_cost:
-                best_of_round, best_of_round_cost, best_of_round_score = cand, c, s
-            elif not q and not best_of_round_qual and s > best_of_round_score:
-                best_of_round, best_of_round_score = cand, s
-        current = best_of_round
-        if best_of_round_qual and not best_qualified:
-            best_qualified = True
-        if best_of_round_qual and best_of_round_cost < best_cost_proxy:
-            best_cost_proxy = best_of_round_cost
-        if best_of_round_score > best_score:
-            best_score = best_of_round_score
-        if best_of_round != current or (best_of_round_qual and best_of_round_cost < cost_proxy):
-            best_candidate = best_of_round
-            best_results = test_all_scenarios(best_of_round, scenarios)
-
-        cand_path = OUTPUT_DIR / f"optimize_iter{iteration}_best.md"
-        cand_path.write_text(current)
-        print(f"  Best of round saved: {cand_path}")
-
-    best_path = OUTPUT_DIR / "AGENTS_best.md"
-    best_path.write_text(best_candidate)
-    print(f"\n{'='*60}")
-    print("OPTIMIZATION COMPLETE")
-    print(f"{'='*60}")
-    print(f"Best: {best_path}")
-    print(f"  Qualified: {best_qualified} | Score: {best_score:.4f} | Cost: {best_cost_proxy:.0f}")
-    if args.apply:
-        (ROOT / "AGENTS.md").write_text(best_candidate)
-        print("Applied to AGENTS.md")
-    return best_candidate
-
-
 def cmd_generate(args):
     """Generate an optimized AGENTS.md using LLM analysis."""
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: pip install anthropic")
+        sys.exit(1)
     if not ANTHROPIC_API_KEY:
         print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
         sys.exit(1)
@@ -1015,6 +911,11 @@ def cmd_test(args):
 
 def cmd_loop(args):
     """Full optimization loop: generate → test → feedback → regenerate."""
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: pip install anthropic")
+        sys.exit(1)
     if not ANTHROPIC_API_KEY:
         print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
         sys.exit(1)
@@ -1141,6 +1042,11 @@ def cmd_optimize(args):
     MetaSPO-inspired bilevel system prompt optimization + optional DSPy.
     Outer loop: failure analysis → multi-candidate generation → evaluate → select best.
     """
+    try:
+        import anthropic
+    except ImportError:
+        print("ERROR: pip install anthropic")
+        sys.exit(1)
     if not ANTHROPIC_API_KEY:
         print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
         sys.exit(1)
@@ -1305,7 +1211,11 @@ def _load_env():
 
 
 def cmd_pipeline(args):
-    """Full pipeline: test → build → validate → print submit steps."""
+    """Full pipeline: test → build → validate → print submit steps.
+
+    For production-parity evaluation (ClawBenchHarness + epoch context), run:
+      python scripts/eval_pack.py --pack pack.json
+    """
     candidate_path = Path(args.candidate)
     if not candidate_path.exists():
         print(f"ERROR: {candidate_path} not found")

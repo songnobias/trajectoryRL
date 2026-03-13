@@ -154,7 +154,7 @@ async def run(args) -> int:
 
     # ── 3. Check Docker services ──────────────────────────────────────────
     mock_url = os.getenv("MOCK_TOOLS_URL", "http://localhost:3001")
-    openclaw_url = os.getenv("OPENCLAW_URL", "http://localhost:18789")
+    openclaw_url = os.getenv("OPENCLAW_URL", "http://localhost:18790")
 
     openclaw_token = os.getenv("OPENCLAW_GATEWAY_TOKEN", "sandbox-token-12345")
 
