@@ -10,7 +10,15 @@ Full pipeline:
   3. pipeline     — test → build → validate → print submit steps
   4. submit       — python neurons/miner.py submit $PACK_URL (after hosting pack)
 
-Modes: generate, test, loop, pipeline, analyze.
+Modes: generate, test, loop, optimize, pipeline, analyze.
+
+Optimization strategies:
+  - loop (default): Simple feedback loop: generate → test → feed failures → regenerate.
+  - optimize --strategy metasco: MetaSPO-inspired bilevel system prompt optimization
+    (failure analysis → multi-candidate generation → evaluate → select best).
+  - optimize --strategy dspy: DSPy declarative modules + MIPROv2-style prompt optimization
+    (requires: pip install dspy-ai).
+
 Env (.env): ANTHROPIC_API_KEY, CLAWBENCH_MODEL. For Docker: CLAWBENCH_LLM_API_KEY,
 CLAWBENCH_LLM_BASE_URL, CLAWBENCH_DEFAULT_MODEL (see clawbench/.env.example).
 """
@@ -590,15 +598,286 @@ def collect_failed_checks(test_results: dict, scenarios: dict | None = None) -> 
                     "pattern": orig.get("pattern", ""),
                     "type": orig.get("type", check.get("type", "?")),
                     "response_preview": result.get("response_preview", "")[:300],
+                    "max_points": orig.get("points", check.get("points", 1)),
                     **check,
                 }
                 failed.append(fc)
     return failed
 
 
+def _format_wrong_examples_metasco(failed_checks: list[dict], scenarios: dict) -> str:
+    """Format failed checks as wrong examples for MetaSPO failure analysis (Table 10 style)."""
+    lines = []
+    for fc in failed_checks[:6]:  # Limit for analysis prompt
+        scenario = fc.get("scenario", "?")
+        prompt = (scenarios.get(scenario, {}).get("prompt", "") or "")[:200]
+        response = fc.get("response_preview", "")[:400]
+        lines.append(
+            f"<Example>\n"
+            f"Scenario: {scenario}\n"
+            f"User Prompt: {prompt}...\n"
+            f"Response: {response}\n"
+            f"Failed check: {fc.get('id', '?')} ({fc.get('category', '?')}) - {fc.get('description', '')}\n"
+            f"Pattern: {fc.get('pattern', '')[:100]}\n"
+            f"</Example>"
+        )
+    return "\n\n".join(lines)
+
+
+def _metasco_analyze_system_prompt(
+    client: anthropic.Anthropic,
+    current_agents: str,
+    wrong_examples: str,
+) -> str:
+    """MetaSPO Table 8: Analyze why the current system prompt fails on wrong examples."""
+    prompt = f"""You are a system prompt writer tasked with improving a language model's system prompt for general tasks. Your goal is to analyze why the current system prompt fails to respond correctly in the given examples.
+
+Follow these instructions carefully:
+### Review the current system prompt:
+{current_agents[:8000]}
+
+### Wrong responses:
+{wrong_examples}
+
+### Remember to focus solely on discussing and improving the system prompt.
+### Wrap the analysis of the system prompt in the <Analysis></Analysis> tags."""
+
+    response = client.messages.create(
+        model=OPTIMIZER_MODEL,
+        max_tokens=4096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text
+    # Extract <Analysis> block if present
+    m = re.search(r"<Analysis>(.*?)</Analysis>", text, re.DOTALL | re.IGNORECASE)
+    return (m.group(1).strip() if m else text).strip()
+
+
+def _metasco_generate_candidate(
+    client: anthropic.Anthropic,
+    current_agents: str,
+    analysis: str,
+    rubric: str,
+    fixtures: str,
+) -> str:
+    """MetaSPO Table 9: Generate an improved system prompt from analysis."""
+    prompt = f"""You are a system prompt writer tasked with improving a language model's system prompt. Your goal is to write a better system prompt that can be generalized for various tasks (ClawBench: inbox triage, morning brief, client escalation, team standup, inbox-to-action).
+
+Follow these instructions carefully:
+### Review the current system prompt:
+{current_agents[:6000]}
+
+### Analysis of the current system prompt:
+{analysis}
+
+### Additional context — ClawBench rubric and fixtures:
+{rubric[:3000]}
+
+{fixtures[:2000]}
+
+### Based on the information provided, write an improved system prompt (AGENTS.md) that:
+1. Addresses the failure analysis
+2. Passes all ClawBench safety and correctness checks (study regex patterns)
+3. Is generic — no hardcoded names, dates, companies
+4. Is under 30KB
+
+### The new system prompt should be wrapped with <improved_system_prompt></improved_system_prompt> tags.
+### Return ONLY the AGENTS.md content inside the tags, no commentary."""
+
+    response = client.messages.create(
+        model=OPTIMIZER_MODEL,
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = response.content[0].text
+    m = re.search(r"<improved_system_prompt>(.*?)</improved_system_prompt>", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Fallback: use whole response if tags missing
+    return text.strip()
+
+
+def _dspy_generate_if_available(
+    rubric: str,
+    fixtures: str,
+    current_agents: str | None,
+    analysis: str | None,
+    failed_checks: list[dict] | None,
+) -> str | None:
+    """Use DSPy module for generation when dspy-ai is installed. Returns None if not available."""
+    try:
+        import dspy
+    except ImportError:
+        return None
+
+    # Configure LM — prefer OpenAI-compatible for DSPy (Anthropic via LiteLLM or direct)
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+
+    # DSPy typically uses openai/... or anthropic/... model strings
+    model = os.getenv("OPTIMIZER_MODEL", "gpt-4o-mini")
+    if "claude" in model.lower():
+        model = f"anthropic/{model.split('/')[-1]}" if "/" in model else "anthropic/claude-sonnet-4-20250514"
+
+    try:
+        lm = dspy.LM(model, api_key=api_key)
+        dspy.configure(lm=lm)
+    except Exception:
+        return None
+
+    # Signature: rubric, fixtures, current, analysis, failed -> agents_md
+    class AgentsMDGenerator(dspy.Signature):
+        """Generate an AGENTS.md policy that passes ClawBench qualification and minimizes cost."""
+
+        rubric: str = dspy.InputField(desc="Scoring rubric with regex patterns")
+        fixtures: str = dspy.InputField(desc="Fixture data summary")
+        current_agents: str = dspy.InputField(desc="Current AGENTS.md for reference")
+        analysis: str = dspy.InputField(desc="Failure analysis from previous run")
+        agents_md: str = dspy.OutputField(desc="Complete AGENTS.md content, valid markdown")
+
+    generate = dspy.ChainOfThought(AgentsMDGenerator)
+    result = generate(
+        rubric=rubric[:4000],
+        fixtures=fixtures[:2000],
+        current_agents=(current_agents or "No prior version")[:4000],
+        analysis=(analysis or "First run, no failures yet")[:2000],
+    )
+    out = getattr(result, "agents_md", None) or getattr(result, "output", "")
+    return out if isinstance(out, str) and len(out) > 100 else None
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+def cmd_optimize(args):
+    """MetaSPO-inspired or DSPy-based system prompt optimization."""
+    if not ANTHROPIC_API_KEY:
+        print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
+        sys.exit(1)
+
+    if not services_ready():
+        print("ERROR: ClawBench services not running. Start with:")
+        print("  cd clawbench && docker compose up -d")
+        sys.exit(1)
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    scenarios = load_all_scenarios()
+    rubric = build_rubric_analysis(scenarios)
+    fixtures = build_fixture_summary(scenarios)
+
+    current = (ROOT / "AGENTS.md").read_text() if (ROOT / "AGENTS.md").exists() else None
+    if not current:
+        print("No existing AGENTS.md. Generating initial candidate via loop...")
+        current, _ = generate_agents_md(client, rubric, fixtures, iteration=1)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    strategy = (args.strategy or "metasco").lower()
+    num_candidates = getattr(args, "num_candidates", 3) or 3
+    max_iterations = getattr(args, "max_rounds", 3) or 3
+
+    best_qualified = False
+    best_cost_proxy = float("inf")
+    best_score = -1.0
+    best_candidate = current
+    best_results = None
+
+    print(f"\nOptimize AGENTS.md | strategy={strategy} | candidates={num_candidates} | iterations={max_iterations}")
+    print("=" * 60)
+
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n--- Outer loop {iteration}/{max_iterations} ---")
+
+        # 1. Evaluate current across all scenarios
+        print("[1/4] Evaluating current AGENTS.md...")
+        results = test_all_scenarios(current, scenarios)
+        failed_checks = collect_failed_checks(results, scenarios)
+        qual = results.get("qualified", False)
+        cost_proxy = results.get("cost_proxy", 0)
+        final_score = results.get("final_score", 0.0)
+
+        print(f"  Qualified: {'YES' if qual else 'NO'} | Score: {final_score:.4f} | Cost: {cost_proxy:.0f}")
+        if not failed_checks:
+            print("  All checks passed!")
+            best_candidate = current
+            best_qualified = qual
+            best_cost_proxy = cost_proxy
+            best_score = final_score
+            break
+
+        # 2. Failure analysis (MetaSPO Table 8)
+        print("[2/4] MetaSPO failure analysis...")
+        wrong_examples = _format_wrong_examples_metasco(failed_checks, scenarios)
+        analysis = _metasco_analyze_system_prompt(client, current, wrong_examples)
+        print(f"  Analysis length: {len(analysis)} chars")
+
+        # 3. Generate N candidates
+        candidates = [current]  # Include current in pool
+        use_dspy = strategy == "dspy"
+        if use_dspy:
+            dspy_out = _dspy_generate_if_available(rubric, fixtures, current, analysis, failed_checks)
+            if dspy_out:
+                candidates.append(dspy_out)
+                print("[3/4] DSPy candidate generated")
+        for i in range(num_candidates - (2 if use_dspy and len(candidates) > 1 else 1)):
+            cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
+            if cand and len(cand) > 500:
+                candidates.append(cand)
+        if len(candidates) == 1:
+            print("[3/4] Generating MetaSPO candidates...")
+            for _ in range(num_candidates - 1):
+                cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
+                if cand and len(cand) > 500:
+                    candidates.append(cand)
+        print(f"  Pool: {len(candidates)} candidates")
+
+        # 4. Evaluate all candidates, select best
+        print("[4/4] Evaluating candidates...")
+        best_of_round = current
+        best_of_round_qual = qual
+        best_of_round_cost = cost_proxy
+        best_of_round_score = final_score
+        for idx, cand in enumerate(candidates):
+            if cand == current and idx > 0:
+                continue
+            r = test_all_scenarios(cand, scenarios)
+            q = r.get("qualified", False)
+            c = r.get("cost_proxy", float("inf"))
+            s = r.get("final_score", 0.0)
+            if q and not best_of_round_qual:
+                best_of_round, best_of_round_qual, best_of_round_cost, best_of_round_score = cand, True, c, s
+            elif q and best_of_round_qual and c < best_of_round_cost:
+                best_of_round, best_of_round_cost, best_of_round_score = cand, c, s
+            elif not q and not best_of_round_qual and s > best_of_round_score:
+                best_of_round, best_of_round_score = cand, s
+        current = best_of_round
+        if best_of_round_qual and not best_qualified:
+            best_qualified = True
+        if best_of_round_qual and best_of_round_cost < best_cost_proxy:
+            best_cost_proxy = best_of_round_cost
+        if best_of_round_score > best_score:
+            best_score = best_of_round_score
+        if best_of_round != current or (best_of_round_qual and best_of_round_cost < cost_proxy):
+            best_candidate = best_of_round
+            best_results = test_all_scenarios(best_of_round, scenarios)
+
+        cand_path = OUTPUT_DIR / f"optimize_iter{iteration}_best.md"
+        cand_path.write_text(current)
+        print(f"  Best of round saved: {cand_path}")
+
+    best_path = OUTPUT_DIR / "AGENTS_best.md"
+    best_path.write_text(best_candidate)
+    print(f"\n{'='*60}")
+    print("OPTIMIZATION COMPLETE")
+    print(f"{'='*60}")
+    print(f"Best: {best_path}")
+    print(f"  Qualified: {best_qualified} | Score: {best_score:.4f} | Cost: {best_cost_proxy:.0f}")
+    if args.apply:
+        (ROOT / "AGENTS.md").write_text(best_candidate)
+        print("Applied to AGENTS.md")
+    return best_candidate
+
+
 def cmd_generate(args):
     """Generate an optimized AGENTS.md using LLM analysis."""
     if not ANTHROPIC_API_KEY:
@@ -857,6 +1136,140 @@ def cmd_loop(args):
     return best_candidate
 
 
+def cmd_optimize(args):
+    """
+    MetaSPO-inspired bilevel system prompt optimization + optional DSPy.
+    Outer loop: failure analysis → multi-candidate generation → evaluate → select best.
+    """
+    if not ANTHROPIC_API_KEY:
+        print("ERROR: Set ANTHROPIC_API_KEY in .env or environment")
+        sys.exit(1)
+
+    if not services_ready():
+        print("ERROR: ClawBench services not running. Start with:")
+        print("  cd clawbench && docker compose up -d")
+        sys.exit(1)
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    scenarios = load_all_scenarios()
+    rubric = build_rubric_analysis(scenarios)
+    fixtures = build_fixture_summary(scenarios)
+
+    current_path = ROOT / "AGENTS.md"
+    current = current_path.read_text() if current_path.exists() else None
+    if not current:
+        print("No AGENTS.md found. Generating initial version...")
+        current, _ = generate_agents_md(client, rubric, fixtures, iteration=1)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    num_candidates = getattr(args, "num_candidates", 3)
+    use_dspy = getattr(args, "strategy", "metasco") == "dspy"
+
+    best_score = -1.0
+    best_qualified = False
+    best_cost_proxy = float("inf")
+    best_candidate = None
+    best_results = None
+
+    for outer_iter in range(1, args.max_rounds + 1):
+        print(f"\n{'#'*60}")
+        print(f"MetaSPO OUTER ITERATION {outer_iter}/{args.max_rounds}")
+        print(f"{'#'*60}")
+
+        # 1. Evaluate current system prompt
+        print("\n[1/4] Evaluating current AGENTS.md...")
+        results = test_all_scenarios(current, scenarios)
+        failed_checks = collect_failed_checks(results, scenarios)
+
+        qual = results.get("qualified", False)
+        cost_proxy = results.get("cost_proxy", 0)
+        print(f"  QUALIFIED: {'YES' if qual else 'NO'}  |  Score: {results['final_score']:.4f}  |  Cost: {cost_proxy:.0f}")
+
+        if qual and cost_proxy < best_cost_proxy:
+            best_qualified = True
+            best_cost_proxy = cost_proxy
+            best_score = results["final_score"]
+            best_results = results
+            best_candidate = current
+
+        if len(failed_checks) == 0:
+            print("\n  All checks passed!")
+            break
+
+        # 2. Failure analysis (MetaSPO Table 8)
+        print("\n[2/4] MetaSPO failure analysis...")
+        wrong_examples = _format_wrong_examples_metasco(failed_checks, scenarios)
+        analysis = _metasco_analyze_system_prompt(client, current, wrong_examples)
+        print(f"  Analysis length: {len(analysis)} chars")
+
+        # 3. Generate N candidates
+        candidates = [current]
+        if use_dspy:
+            dspy_out = _dspy_generate_if_available(rubric, fixtures, current, analysis, failed_checks)
+            if dspy_out:
+                candidates.append(dspy_out)
+                print("\n[3/4] DSPy candidate generated")
+        for i in range(num_candidates - (2 if use_dspy and candidates else 1)):
+            cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
+            if cand and len(cand) > 500:
+                candidates.append(cand)
+        if len(candidates) == 1:
+            cand = _metasco_generate_candidate(client, current, analysis, rubric, fixtures)
+            if cand:
+                candidates.append(cand)
+
+        print(f"\n[3/4] Generated {len(candidates)} candidates")
+
+        # 4. Evaluate and select best
+        print("\n[4/4] Evaluating candidates across all scenarios...")
+        for idx, cand in enumerate(candidates):
+            if cand == current:
+                r = results
+            else:
+                r = test_all_scenarios(cand, scenarios)
+            cq = r.get("qualified", False)
+            cp = r.get("cost_proxy", 0)
+            cs = r.get("final_score", 0)
+            better = (cq and not best_qualified) or (cq and best_qualified and cp < best_cost_proxy) or (
+                not best_qualified and cs > best_score
+            )
+            if better:
+                best_qualified = cq
+                best_cost_proxy = cp
+                best_score = cs
+                best_candidate = cand
+                best_results = r
+                print(f"  Candidate {idx+1}: NEW BEST (qualified={cq}, cost={cp:.0f})")
+            else:
+                print(f"  Candidate {idx+1}: qual={cq}, cost={cp:.0f}")
+
+        current = best_candidate
+        (OUTPUT_DIR / f"metasco_iter_{outer_iter}_best.md").write_text(current)
+        results_path = OUTPUT_DIR / f"metasco_iter_{outer_iter}_results.json"
+        with open(results_path, "w") as f:
+            json.dump(best_results, f, indent=2, default=str)
+
+        if best_qualified and best_results.get("final_score", 0) >= 0.95:
+            print("\n  Excellent score, stopping early.")
+            break
+
+    best_path = OUTPUT_DIR / "AGENTS_best.md"
+    if best_candidate:
+        best_path.write_text(best_candidate)
+    print(f"\n{'='*60}")
+    print("MetaSPO OPTIMIZATION COMPLETE")
+    print(f"{'='*60}")
+    print(f"Best: {best_path}")
+    print(f"  Qualified: {best_qualified}  |  Score: {best_score:.4f}  |  Cost: {best_cost_proxy:.0f}")
+
+    if best_candidate and args.apply:
+        (ROOT / "AGENTS.md").write_text(best_candidate)
+        print("Applied to AGENTS.md")
+
+    return best_candidate
+
+
 def cmd_analyze(args):
     """Print the full rubric analysis without generating anything."""
     scenarios = load_all_scenarios()
@@ -981,6 +1394,21 @@ def main():
     loop.add_argument("--max-rounds", "-r", type=int, default=5)
     loop.add_argument("--apply", action="store_true")
 
+    opt = subparsers.add_parser(
+        "optimize",
+        help="MetaSPO + DSPy: bilevel system prompt optimization (failure analysis → candidates → select)",
+    )
+    opt.add_argument(
+        "--strategy",
+        "-s",
+        choices=["metasco", "dspy"],
+        default="metasco",
+        help="metasco: MetaSPO-style analysis+generation; dspy: use DSPy module when installed",
+    )
+    opt.add_argument("--max-rounds", "-r", type=int, default=3)
+    opt.add_argument("--num-candidates", "-n", type=int, default=3)
+    opt.add_argument("--apply", action="store_true")
+
     pipe = subparsers.add_parser("pipeline", help="Test → build → validate → print submit steps")
     pipe.add_argument("--candidate", "-c", type=str, default="AGENTS.md")
     pipe.add_argument("--output", "-o", type=str, default="pack.json")
@@ -999,6 +1427,8 @@ def main():
         cmd_loop(args)
     elif args.command == "pipeline":
         cmd_pipeline(args)
+    elif args.command == "optimize":
+        cmd_optimize(args)
     elif args.command == "analyze":
         cmd_analyze(args)
     else:
