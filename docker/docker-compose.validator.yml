@@ -27,6 +27,7 @@ services:
       - ../.env.validator
     volumes:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+      - trajectoryrl_data:/var/lib/trajectoryrl
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     logging:
@@ -46,9 +47,12 @@ services:
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_INCLUDE_STOPPED=true
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: "json-file"
       options:
         max-size: "5m"
         max-file: "2"
+
+volumes:
+  trajectoryrl_data:
